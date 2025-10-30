@@ -82,6 +82,7 @@ def init_db():
         for ddl in (
             "ALTER TABLE users ADD COLUMN age INTEGER",
             "ALTER TABLE users ADD COLUMN locale TEXT",
+            "ALTER TABLE recipes ADD COLUMN likes INTEGER DEFAULT 0",
             "ALTER TABLE recipes ADD COLUMN cuisine TEXT",
             "ALTER TABLE recipes ADD COLUMN reaction TEXT",
             "ALTER TABLE recipes ADD COLUMN tags TEXT",
