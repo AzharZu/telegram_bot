@@ -5,9 +5,13 @@ import random
 import re
 import logging
 import sqlite3
+import uuid
+from datetime import datetime
 from contextlib import closing
-from typing import Iterable, Optional
+from enum import IntEnum
+from typing import Dict, Iterable, Optional
 
+import ai_service
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -17,9 +21,9 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputFile,
+    BotCommand,
 )
 from telegram.constants import ChatAction
-from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
@@ -29,23 +33,83 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
+    Application,
 )
+from telegram.request import HTTPXRequest
 
-from db import get_conn, init_db
+from db import get_conn, init_db, increment_preference_feedback, upsert_user_preferences
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN отсутствует в .env")
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEFAULT_GEMINI_MODEL = "models/gemini-1.5-flash-latest"
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", DEFAULT_GEMINI_MODEL)
+if GEMINI_API_KEY:
+    ai_service.init_ai_service(GEMINI_API_KEY, GEMINI_MODEL_NAME)
+else:
+    logging.warning("⚠️ GEMINI_API_KEY отсутствует. Команда /ask работать не будет.")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("FindFood4")
 
-ASK_NAME, ASK_AGE, ASK_CITY, CHOOSE_MODE, CHOOSE_TASTE, ASK_QUERY = range(6)
+ASK_NAME, ASK_AGE, ASK_CITY = range(3)
+
+
+class UserFlow(IntEnum):
+    choosing_mode = 10
+    choosing_category = 11
+    waiting_for_input = 12
+    showing_result = 13
+
+
+CHOOSE_MODE = UserFlow.choosing_mode
+CHOOSE_TASTE = UserFlow.choosing_category
+ASK_QUERY = UserFlow.waiting_for_input
+SHOW_RESULT = UserFlow.showing_result
 
 CONTROL_BACK = "⬅️ Назад"
 CONTROL_FINISH = "👋🏻 Закончить"
 CONTROL_RANDOM = "🎲 Не знаю, что хочу"
+AI_REJECT_LIMIT = 3
+AI_LOG_PATH = "ai_logs.txt"
+PROCESSING_RANDOM = "processing_random"
+PROCESSING_CATEGORY = "processing_category"
+LAST_SUGGESTION = "last_suggestion"
+SKIP_NEXT_MESSAGE = "skip_next_intro"
+DEFAULT_DELAY_RANGE = (0.8, 1.2)
+
+AI_BRIDGE_PHRASES = (
+    "🥄 Думаю о чём-то вкусном…",
+    "🍴 Готовлю ответ…",
+    "✨ Есть идея!",
+)
+
+RECIPE_INTROS = (
+    "Вот идея, которую можно попробовать 👇",
+    "Давай попробуем это 👇",
+    "Тебе может понравиться этот рецепт 👇",
+)
+
+PLACE_INTROS = (
+    "Советую заглянуть сюда 👇",
+    "Попробуй это место 👇",
+    "Похоже, тебе может понравиться 👇",
+)
+
+LIKE_REPLIES = (
+    "❤️ Супер! Учту твой вкус.",
+    "❤️ Сохранил! Буду подбирать похожее.",
+    "❤️ Добавил в твои предпочтения!",
+)
+
+FALLBACK_PREFACES = (
+    "😅 Пока не нашёл ничего подходящего, но вот идея 👇",
+    "🍀 Пока база молчит, держи свежий вариант 👇",
+    "✨ Придумал кое-что интересное 👇",
+)
 
 CATEGORY_MEDIA = {
     "sweet": "sweet.jpg",
@@ -73,7 +137,7 @@ TASTE_TOKENS = {
         "рамен", "рамэн", "лапша", "карри", "чили", "жгуч"
     ),
     "healthy": (
-        "полез", "здоров", "лёгк", "овощ", "healthy", "🥗", "фитнес",
+        "полез", "здоров", "лёгк", "легки", "овощ", "healthy", "🥗", "фитнес",
         "боул", "зож", "детокс", "салат", "овсян", "авокад"
     ),
 }
@@ -142,6 +206,229 @@ CATEGORY_HINTS = {
 }
 
 DEFAULT_TASTES = ("sweet", "salty", "spicy", "healthy")
+
+USER_STATE: Dict[int, Dict[str, Optional[str]]] = {}
+
+
+async def cozy_delay():
+    await asyncio.sleep(random.uniform(*DEFAULT_DELAY_RANGE))
+
+
+def limit_paragraph_length(paragraph: str, max_len: int = 150) -> str:
+    text = (paragraph or "").strip()
+    if len(text) <= max_len:
+        return text
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_len:
+        split_at = remaining.rfind(" ", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return "\n".join(filter(None, chunks))
+
+
+def prepare_ai_response(raw: str) -> str:
+    if not raw:
+        return ""
+    primary_block = raw.strip().split("\n\n")[0].strip()
+    lines = [line.strip() for line in primary_block.split("\n") if line.strip()]
+    if not lines:
+        return limit_paragraph_length(primary_block)
+    deduped: list[str] = []
+    for line in lines:
+        formatted = limit_paragraph_length(line)
+        if formatted and (not deduped or formatted != deduped[-1]):
+            deduped.append(formatted)
+        if len(deduped) == 3:
+            break
+    return "\n\n".join(deduped[:3])
+
+
+def pick_bridge_phrase() -> str:
+    return random.choice(AI_BRIDGE_PHRASES)
+
+
+def ensure_user_state(user_id: int) -> Dict[str, Optional[str]]:
+    return USER_STATE.setdefault(
+        user_id,
+        {
+            "mode": None,
+            "category": None,
+            "city": None,
+            "last_query": None,
+            "last_choice": None,
+            PROCESSING_RANDOM: False,
+            PROCESSING_CATEGORY: False,
+        },
+    )
+
+
+def remember_context(
+    user_id: int,
+    *,
+    mode: Optional[str] = None,
+    category: Optional[str] = None,
+    city: Optional[str] = None,
+    query: Optional[str] = None,
+    last_choice: Optional[str] = None,
+):
+    state = ensure_user_state(user_id)
+    if mode is not None:
+        state["mode"] = mode
+    if category is not None:
+        state["category"] = category
+    if city is not None:
+        state["city"] = city
+    if query is not None:
+        state["last_query"] = query
+    if last_choice is not None:
+        state["last_choice"] = last_choice
+
+    try:
+        if any(value is not None for value in (mode, category, query)):
+            upsert_user_preferences(user_id, mode=mode, category=category, query=query)
+    except sqlite3.Error as exc:
+        log.warning("Не удалось обновить user_preferences: %s", exc)
+
+
+def set_processing_random(user_id: int, value: bool):
+    state = ensure_user_state(user_id)
+    state[PROCESSING_RANDOM] = value
+
+
+def is_processing_random(user_id: int) -> bool:
+    return ensure_user_state(user_id).get(PROCESSING_RANDOM, False)
+
+
+def set_processing_category(user_id: int, value: bool):
+    state = ensure_user_state(user_id)
+    state[PROCESSING_CATEGORY] = value
+
+
+def is_processing_category(user_id: int) -> bool:
+    return ensure_user_state(user_id).get(PROCESSING_CATEGORY, False)
+
+
+def get_last_suggestions(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.user_data.setdefault(LAST_SUGGESTION, {"recipe": None, "place": None})
+
+
+def update_last_suggestion(context: ContextTypes.DEFAULT_TYPE, item_type: str, item_id):
+    suggestions = get_last_suggestions(context)
+    suggestions[item_type] = item_id
+
+
+def is_last_suggestion(context: ContextTypes.DEFAULT_TYPE, item_type: str, item_id) -> bool:
+    suggestions = get_last_suggestions(context)
+    return suggestions.get(item_type) == item_id
+
+
+def suggestion_id(item: Optional[dict]) -> Optional[int]:
+    if not item:
+        return None
+    return item.get("id")
+
+
+def log_ai_interaction(user_id: int, question: str, answer: str, status: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO ai_logs(user_id, question, answer, status)
+            VALUES (?,?,?,?)
+            """,
+            (user_id, question, answer, status),
+        )
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(AI_LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{timestamp}] User {user_id} → Prompt: \"{question}\"\n")
+            if answer:
+                log_file.write(f"AI → Answer ({status}): \"{answer}\"\n\n")
+            else:
+                log_file.write(f"AI → Answer ({status}): <empty>\n\n")
+    except OSError as exc:
+        log.warning("Не удалось записать ai_logs.txt: %s", exc)
+
+
+def save_feedback(question: str, answer: str, user_id: int, liked: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO feedback(question, answer, user_id, liked)
+            VALUES (?,?,?,?)
+            """,
+            (question, answer, user_id, liked),
+        )
+
+
+def save_qa_entry(question: str, answer: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO qa(question, answer)
+            VALUES(?,?)
+            """,
+            (question, answer),
+        )
+
+
+def fetch_qa_answer(question: str):
+    norm = normalize(question)
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT answer, image FROM qa WHERE lower(question)=?",
+            (norm,),
+        ).fetchone()
+    return row
+
+
+def ai_feedback_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👍 Понравился ответ", callback_data=f"ai_like|{session_id}"),
+                InlineKeyboardButton("👎 Не понравился", callback_data=f"ai_dislike|{session_id}"),
+            ]
+        ]
+    )
+
+
+def get_ai_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.chat_data.setdefault("ai_sessions", {})
+
+
+def build_refinement_prompt(question: str, previous_answer: str) -> str:
+    return (
+        f"{question.strip()}\n\n"
+        f"Предыдущий ответ был не принят пользователем:\n\"{previous_answer.strip()}\".\n"
+        "Переформулируй ответ, сделай его короче, понятнее и более полезным. "
+        "Если в вопросе о еде, добавь конкретные идеи. Ответь дружелюбно на русском языке."
+    )
+
+
+async def generate_ai_answer(prompt: str, user_id: int, original_question: str) -> str:
+    if not ai_service.is_ai_available():
+        raise RuntimeError("Gemini API не настроен.")
+
+    try:
+        answer = await ai_service.ask_ai(prompt)
+        status = "success" if answer else "empty"
+        log_ai_interaction(user_id, original_question, answer, status)
+        if not answer:
+            raise RuntimeError("Модель не вернула текста.")
+        return answer
+    except Exception as exc:
+        log_ai_interaction(user_id, original_question, "", f"error: {exc}")
+        message = str(exc)
+        if "404" in message and "models" in message:
+            raise RuntimeError(
+                "Модель недоступна. Укажи актуальное имя в GEMINI_MODEL_NAME, например 'models/gemini-1.5-flash-latest'."
+            ) from exc
+        raise
 
 
 def normalize(text: Optional[str]) -> str:
@@ -214,6 +501,47 @@ def get_media_path(name: Optional[str]) -> Optional[str]:
     return None
 
 
+async def send_text_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, reply_markup=None):
+    """Telegram API ограничивает сообщения ~4096 символами."""
+
+    max_len = 3900  # небольшое окно для подписи/эмодзи
+    if len(text) <= max_len:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        return
+
+    chunks = []
+    current = []
+    length = 0
+    for paragraph in text.split("\n"):
+        paragraph_with_break = (paragraph + "\n") if paragraph else "\n"
+        if length + len(paragraph_with_break) > max_len and current:
+            chunks.append("".join(current))
+            current = []
+            length = 0
+        current.append(paragraph_with_break)
+        length += len(paragraph_with_break)
+    if current:
+        chunks.append("".join(current))
+
+    for i, chunk in enumerate(chunks):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+        )
+
+
+async def send_paragraphs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, reply_markup=None):
+    paragraphs = [part.strip() for part in (text or "").split("\n\n") if part.strip()]
+    if not paragraphs:
+        return
+    total = len(paragraphs)
+    for idx, part in enumerate(paragraphs):
+        await send_text_safely(context, chat_id, part, reply_markup if idx == total - 1 else None)
+        if idx < total - 1:
+            await cozy_delay()
+
+
 async def send_visual(context: ContextTypes.DEFAULT_TYPE, chat_id: int, image: Optional[str], text: Optional[str],
                       reply_markup=None):
     path = get_media_path(image)
@@ -227,22 +555,138 @@ async def send_visual(context: ContextTypes.DEFAULT_TYPE, chat_id: int, image: O
                     reply_markup=reply_markup,
                 )
         elif text:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            await send_text_safely(context, chat_id, text, reply_markup=reply_markup)
     except Forbidden:
         log.warning("Cannot send to chat %s – bot blocked or not started.", chat_id)
     except TelegramError as exc:
         log.exception("Failed to send visual to %s: %s", chat_id, exc)
 
 
-async def send_thinking(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str = "🤔 Думаю..."):
+async def send_thinking(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str = "🤔 Думаю, что тебе предложить…", notify: bool = False):
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        if notify and text:
+            await send_text_safely(context, chat_id, text)
         await asyncio.sleep(0.4)
     except Forbidden:
         log.warning("Cannot notify chat %s – bot blocked or not started.", chat_id)
     except TelegramError as exc:
         log.exception("Failed to send typing notice to %s: %s", chat_id, exc)
+
+
+async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = " ".join(context.args or []).strip()
+    if not question:
+        await update.message.reply_text(
+            "Задай вопрос вместе с командой, например:\n"
+            "/ask Какой десерт быстро приготовить?"
+        )
+        return
+    await handle_ai_question(update, context, question)
+
+
+async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, session_id: Optional[str] = None):
+    chat_id = update.effective_chat.id
+    if not session_id:
+        row = fetch_qa_answer(question)
+        if row:
+            answer, image = row["answer"], row["image"]
+            prefix = "Нашёл ответ в базе знаний 👇\n\n"
+            if image:
+                await send_visual(context, chat_id, image, prefix + answer)
+            else:
+                await send_text_safely(context, chat_id, prefix + answer)
+            return
+
+    if not ai_service.is_ai_available():
+        await send_text_safely(context, chat_id, "⚠️ ИИ недоступен. Проверь ключ GEMINI_API_KEY.")
+        return
+
+    sessions = get_ai_sessions(context)
+    prev_session = sessions.get(session_id) if session_id else None
+    refined_prompt = None
+    if prev_session:
+        refined_prompt = build_refinement_prompt(prev_session["question"], prev_session["answer"])
+        question_for_ai = prev_session["question"]
+    else:
+        question_for_ai = question
+
+    prompt = refined_prompt or question_for_ai
+    try:
+        answer = await generate_ai_answer(prompt, chat_id, question_for_ai)
+    except Exception as exc:
+        log.warning("/ask failed: %s", exc)
+        await send_text_safely(
+            context,
+            chat_id,
+            "⚠️ Не удалось получить ответ. Попробуем снова чуть позже.",
+        )
+        return
+
+    session_id = session_id or str(uuid.uuid4())
+    session_record = {
+        "question": question_for_ai,
+        "answer": answer,
+        "rejections": prev_session["rejections"] if prev_session else 0,
+    }
+    sessions[session_id] = session_record
+
+    formatted = prepare_ai_response(answer)
+    paragraphs = [part.strip() for part in formatted.split("\n\n") if part.strip()] if formatted else []
+    if paragraphs:
+        paragraphs[0] = f"{pick_bridge_phrase()}\n{paragraphs[0]}"
+    else:
+        paragraphs = [pick_bridge_phrase()]
+    payload = "\n\n".join(paragraphs)
+    await send_paragraphs(
+        context,
+        chat_id,
+        payload,
+        reply_markup=ai_feedback_keyboard(session_id),
+    )
+
+
+async def ai_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if "|" not in data:
+        return
+    action, session_id = data.split("|", 1)
+    sessions = get_ai_sessions(context)
+    session = sessions.get(session_id)
+    if not session:
+        await query.edit_message_reply_markup(None)
+        await query.message.reply_text("Сессия не найдена. Попробуй спросить ещё раз 🤖")
+        return
+
+    question = session["question"]
+    answer = session["answer"]
+    user_id = query.from_user.id
+
+    if action == "ai_like":
+        save_feedback(question, answer, user_id, 1)
+        save_qa_entry(question, answer)
+        update_taste_profile_from_text(user_id, f"{question} {answer}", True)
+        sessions.pop(session_id, None)
+        await query.edit_message_reply_markup(None)
+        await query.message.reply_text("❤️ Спасибо! Я запомнил этот ответ.")
+        return
+
+    if action == "ai_dislike":
+        save_feedback(question, answer, user_id, 0)
+        update_taste_profile_from_text(user_id, f"{question} {answer}", False)
+        session["rejections"] = session.get("rejections", 0) + 1
+        if session["rejections"] >= AI_REJECT_LIMIT:
+            sessions.pop(session_id, None)
+            await query.edit_message_reply_markup(None)
+            await query.message.reply_text(
+                "😔 Не удалось подобрать подходящий ответ. Попробуй переформулировать вопрос или обратись к оператору."
+            )
+            return
+        await query.edit_message_reply_markup(None)
+        await query.message.reply_text("Понял, попробую сформулировать по-другому 🔄")
+        await handle_ai_question(update, context, question, session_id=session_id)
 
 
 def reset_session(context: ContextTypes.DEFAULT_TYPE):
@@ -325,16 +769,14 @@ def taste_keyboard() -> ReplyKeyboardMarkup:
 def mode_keyboard() -> ReplyKeyboardMarkup:
     keys = [
         [KeyboardButton("🥣 Хочу рецепт"), KeyboardButton("🏙️ Хочу заведение")],
+        [KeyboardButton(CONTROL_RANDOM)],
         [KeyboardButton(CONTROL_FINISH)],
     ]
     return ReplyKeyboardMarkup(keys, resize_keyboard=True, one_time_keyboard=True)
 
 
 def query_keyboard() -> ReplyKeyboardMarkup:
-    keys = [
-        [KeyboardButton(CONTROL_RANDOM)],
-        [KeyboardButton(CONTROL_BACK), KeyboardButton(CONTROL_FINISH)],
-    ]
+    keys = [[KeyboardButton(CONTROL_RANDOM)], [KeyboardButton(CONTROL_BACK), KeyboardButton(CONTROL_FINISH)]]
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
 
@@ -345,6 +787,24 @@ def taste_label(cat: Optional[str]) -> str:
         "spicy": "остренького",
         "healthy": "полезного и лёгкого",
     }.get(cat or "", "чего-то вкусного")
+
+
+def category_short_label(cat: Optional[str]) -> str:
+    return {
+        "sweet": "сладкое",
+        "salty": "солёное",
+        "spicy": "острое",
+        "healthy": "здоровое",
+    }.get(cat or "", "любую еду")
+
+
+def taste_prompt_label(cat: Optional[str]) -> str:
+    return {
+        "sweet": "sweet dessert",
+        "salty": "savory dish",
+        "spicy": "spicy meal",
+        "healthy": "healthy recipe",
+    }.get(cat or "", "comfort food")
 
 
 def store_queue(context: ContextTypes.DEFAULT_TYPE, item_type: str, items: Iterable[dict], meta: dict):
@@ -532,10 +992,32 @@ def apply_feedback(conn, chat_id: int, item: dict, item_type: str, liked: bool):
             conn.execute(
                 "INSERT OR IGNORE INTO favorites(chat_id, recipe_id) VALUES(?,?)",
                 (chat_id, item.get("id")),
-            )
+        )
         conn.execute(
             "UPDATE recipes SET likes = likes + ? WHERE id=?",
             (1 if liked else 0, item.get("id")),
+        )
+    try:
+        increment_preference_feedback(chat_id, liked)
+    except sqlite3.Error as exc:
+        log.warning("Не удалось обновить user_preferences по фидбеку: %s", exc)
+
+
+def update_taste_profile_from_text(chat_id: int, text: str, liked: bool):
+    category = detect_category_from_text(text)
+    if not category:
+        return
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO user_tastes(chat_id, category, likes, dislikes)
+            VALUES (?,?,?,?)
+            ON CONFLICT(chat_id, category) DO UPDATE SET
+                likes = likes + excluded.likes,
+                dislikes = dislikes + excluded.dislikes,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (chat_id, category, 1 if liked else 0, 0 if liked else 1),
         )
 
 
@@ -579,9 +1061,10 @@ async def maybe_send_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         "spicy": "острые блюда",
         "healthy": "лёгкая и полезная еда",
     }.get(category, category)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🧠 Похоже, тебе нравится {label}!\nХочешь, подберу 3 новинки в этом вкусе?",
+    await send_text_safely(
+        context,
+        chat_id,
+        f"🧠 Похоже, тебе нравится {label}!\nХочешь, подберу 3 новинки в этом вкусе?",
         reply_markup=query_keyboard(),
     )
 
@@ -590,6 +1073,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     ensure_synonyms()
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    ensure_user_state(user_id)
     reset_session(context)
     user = get_user(chat_id)
     if not user:
@@ -602,7 +1087,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["stage"] = "registration_name"
         return ASK_NAME
 
-    context.user_data.update({"name": user["name"], "city": user["city"], "stage": "mode"})
+    context.user_data.update({"name": user["name"], "city": user["city"], "stage": UserFlow.choosing_mode.name})
+    remember_context(user_id, city=user["city"])
     await send_visual(
         context,
         chat_id,
@@ -641,6 +1127,7 @@ async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши, из какого ты города.")
         return ASK_CITY
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
     upsert_user(
         chat_id,
         context.user_data.get("name", "друг"),
@@ -648,7 +1135,8 @@ async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         city,
     )
     context.user_data["city"] = city
-    context.user_data["stage"] = "mode"
+    context.user_data["stage"] = UserFlow.choosing_mode.name
+    remember_context(user_id, city=city)
     await send_visual(
         context,
         chat_id,
@@ -662,31 +1150,60 @@ async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    norm_text = normalize(text)
+    if norm_text == normalize(CONTROL_RANDOM):
+        state = ensure_user_state(user_id)
+        if is_processing_random(user_id):
+            return ASK_QUERY
+        mode_choice = state.get("mode") or context.user_data.get("mode") or "recipe"
+        taste_choice = state.get("category") or context.user_data.get("taste")
+        context.user_data["mode"] = mode_choice
+        if taste_choice:
+            context.user_data["taste"] = taste_choice
+        context.user_data["stage"] = UserFlow.waiting_for_input.name
+        remember_context(user_id, mode=mode_choice, category=taste_choice)
+        context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+        set_processing_random(user_id, True)
+        await send_text_safely(context, chat_id, "Сейчас подберу что-то интересное! 🍀", reply_markup=query_keyboard())
+        await cozy_delay()
+        if mode_choice == "restaurant":
+            await send_random_place(update, context, taste_choice)
+        else:
+            await send_random_recipe(update, context, taste_choice)
+        set_processing_random(user_id, False)
+        return ASK_QUERY
+
     mode = resolve_mode(text)
     if not mode:
         await update.message.reply_text("Выбери кнопку: 🥣 рецепт или 🏙️ заведение.")
         return CHOOSE_MODE
 
     context.user_data["mode"] = mode
-    context.user_data["stage"] = "taste"
-    await send_visual(context, chat_id, CATEGORY_MEDIA["loading"], "🤔 Думаю, что тебе предложить...")
-    if mode == "recipe":
-        await context.bot.send_message(chat_id=chat_id, text="Что хочется приготовить? 🍽", reply_markup=taste_keyboard())
-    else:
-        await context.bot.send_message(chat_id=chat_id, text="Что хочется поесть? 🍽", reply_markup=taste_keyboard())
+    context.user_data["stage"] = UserFlow.choosing_category.name
+    remember_context(user_id, mode=mode)
+    await send_visual(context, chat_id, CATEGORY_MEDIA["loading"], "🤔 Думаю, что тебе предложить…")
+    await cozy_delay()
+    prompt = "Что хочется сегодня приготовить?" if mode == "recipe" else "Что хочется сегодня попробовать?"
+    await send_text_safely(context, chat_id, prompt, reply_markup=taste_keyboard())
     return CHOOSE_TASTE
 
 
 async def handle_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = normalize(update.message.text)
+    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
     if text == normalize(CONTROL_BACK):
         stage = context.user_data.get("stage")
-        if stage in ("query", "random"):
-            context.user_data["stage"] = "taste"
+        if stage in (UserFlow.waiting_for_input.name, UserFlow.showing_result.name):
+            context.user_data["stage"] = UserFlow.choosing_category.name
+            context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+            set_processing_random(user_id, False)
             await update.message.reply_text("Окей, вернёмся к выбору вкуса 👇", reply_markup=taste_keyboard())
             return CHOOSE_TASTE
-        context.user_data["stage"] = "mode"
-        await update.message.reply_text("Вернул на шаг выбора режима 😊", reply_markup=mode_keyboard())
+        context.user_data["stage"] = UserFlow.choosing_mode.name
+        context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+        set_processing_random(user_id, False)
+        await update.message.reply_text("Возвращаю в главное меню 🏠", reply_markup=mode_keyboard())
         return CHOOSE_MODE
     if text == normalize(CONTROL_FINISH):
         name = context.user_data.get("name", "друг")
@@ -709,33 +1226,143 @@ async def handle_taste(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text or ""
     category = resolve_category(text)
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    state = ensure_user_state(user_id)
+    mode = context.user_data.get("mode") or state.get("mode") or "recipe"
+    if is_processing_category(user_id):
+        return CHOOSE_TASTE if category is None else ASK_QUERY
     if category is None:
         await update.message.reply_text("Выбери вкус из списка или нажми 🎲", reply_markup=taste_keyboard())
         return CHOOSE_TASTE
 
-    context.user_data["taste"] = category
-    context.user_data["stage"] = "query" if category != "random" else "random"
+    set_processing_category(user_id, True)
 
     if category == "random":
-        mode = context.user_data.get("mode", "recipe")
+        fallback_category = state.get("category") or context.user_data.get("taste")
+        if is_processing_random(user_id):
+            set_processing_category(user_id, False)
+            return ASK_QUERY
+        set_processing_random(user_id, True)
+        if fallback_category:
+            context.user_data["taste"] = fallback_category
+        context.user_data["stage"] = UserFlow.waiting_for_input.name
+        context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+        await send_text_safely(context, chat_id, "Сейчас подберу что-то интересное! 🍀", reply_markup=query_keyboard())
+        await cozy_delay()
         if mode == "recipe":
-            await send_random_recipe(update, context, None)
+            await send_random_recipe(update, context, fallback_category)
         else:
-            await send_random_place(update, context, None)
+            await send_random_place(update, context, fallback_category)
+        set_processing_random(user_id, False)
+        set_processing_category(user_id, False)
         return ASK_QUERY
 
-    if context.user_data.get("mode") == "recipe":
+    context.user_data["taste"] = category
+    context.user_data["stage"] = UserFlow.waiting_for_input.name
+    remember_context(user_id, category=category)
+
+    if mode == "recipe":
         prompt = "Напиши блюдо или ключевое слово (например: «рамэн», «чизкейк», «суп») или жми 🎲"
     else:
         prompt = "Напиши, что хочется (например: «кофейня», «стейки», «суши») или жми 🎲"
-    await update.message.reply_text(f"{prompt}", reply_markup=query_keyboard())
+    visual = CATEGORY_MEDIA.get(category)
+    await send_visual(context, chat_id, visual, prompt, reply_markup=query_keyboard())
+    set_processing_category(user_id, False)
     return ASK_QUERY
+
+
+async def send_ai_suggestions(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    user_id: int,
+    mode: str,
+    category: Optional[str],
+    query: Optional[str],
+    city: Optional[str],
+    preface: Optional[str] = None,
+):
+    if not ai_service.is_ai_available():
+        return
+
+    if preface:
+        await send_text_safely(context, chat_id, preface, reply_markup=query_keyboard())
+        await cozy_delay()
+
+    taste_hint = taste_prompt_label(category)
+    intent = mode if mode in ("recipe", "restaurant") else "neutral"
+    if not category:
+        intent = "neutral"
+
+    prompt = ai_service.build_recommendation_prompt(
+        city=city,
+        category=category,
+        mode=intent,
+        query=query,
+        taste_hint=taste_hint,
+    )
+
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    except TelegramError:
+        pass
+    await cozy_delay()
+
+    try:
+        answer = await generate_ai_answer(prompt, user_id, query or prompt)
+    except Exception as exc:
+        log.warning("AI fallback error: %s", exc)
+        await send_text_safely(context, chat_id, "⚠️ Не удалось получить ответ. Попробуем снова чуть позже.", reply_markup=query_keyboard())
+        return
+
+    formatted = prepare_ai_response(answer)
+    paragraphs = [part.strip() for part in formatted.split("\n\n") if part.strip()] if formatted else []
+    if paragraphs:
+        paragraphs[0] = f"{pick_bridge_phrase()}\n{paragraphs[0]}"
+    else:
+        paragraphs = [pick_bridge_phrase()]
+    payload = "\n\n".join(paragraphs)
+
+    await send_text_safely(context, chat_id, payload, reply_markup=query_keyboard())
+    remember_context(user_id, mode=mode, category=category, city=city, last_choice="ai_suggestion")
+
+
+async def handle_no_results(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    user_id: int,
+    mode: str,
+    category: Optional[str],
+    query: Optional[str],
+    city: Optional[str],
+):
+    await send_visual(
+        context,
+        chat_id,
+        CATEGORY_MEDIA.get("not_found"),
+        random.choice(FALLBACK_PREFACES),
+        reply_markup=query_keyboard(),
+    )
+    await cozy_delay()
+    await send_ai_suggestions(
+        context,
+        chat_id,
+        user_id=user_id,
+        mode=mode,
+        category=category,
+        query=query,
+        city=city,
+    )
 
 
 async def send_recipe_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, recipe: dict):
     if not recipe:
         return
+    intro = random.choice(RECIPE_INTROS)
     caption = (
+        f"{intro}\n\n"
         f"🍽 {recipe['title']}\n"
         f"🧂 {recipe.get('ingredients', '')}\n"
         f"📝 {recipe.get('steps', '')}"
@@ -747,13 +1374,17 @@ async def send_recipe_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, rec
             InlineKeyboardButton("🔁 Следующий", callback_data="recipe:next"),
         ]
     ])
-    await send_visual(context, chat_id, None, caption, reply_markup=kb)
+    image_name = recipe.get("image") or CATEGORY_MEDIA.get(recipe.get("category") or context.user_data.get("taste"))
+    await send_visual(context, chat_id, image_name, caption, reply_markup=kb)
+    update_last_suggestion(context, "recipe", suggestion_id(recipe))
 
 
 async def send_place_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, place: dict):
     if not place:
         return
+    intro = random.choice(PLACE_INTROS)
     caption = (
+        f"{intro}\n\n"
         f"🍴 {place['name']}\n📍 {place['address']} · ⭐️ {place.get('rating', '4.5')} · {place.get('cuisine', '')}"
     )
     kb = InlineKeyboardMarkup([
@@ -763,54 +1394,97 @@ async def send_place_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, plac
             InlineKeyboardButton("🔁 Другой", callback_data="place:next"),
         ]
     ])
-    await send_visual(context, chat_id, None, caption, reply_markup=kb)
+    image_name = place.get("image") or CATEGORY_MEDIA.get(place.get("category") or context.user_data.get("taste"))
+    await send_visual(context, chat_id, image_name, caption, reply_markup=kb)
+    update_last_suggestion(context, "place", suggestion_id(place))
 
 
 async def send_random_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE, taste: Optional[str]):
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    state = ensure_user_state(user_id)
+    preferred_taste = taste or context.user_data.get("taste") or state.get("category")
     with closing(get_conn()) as conn:
-        recipe = fetch_random_recipe(conn, chat_id, taste or context.user_data.get("taste"))
+        recipe = fetch_random_recipe(conn, chat_id, preferred_taste)
     if not recipe:
-        await send_visual(
+        context.user_data["stage"] = UserFlow.showing_result.name
+        await handle_no_results(
             context,
             chat_id,
-            CATEGORY_MEDIA["not_found"],
-            "😅 Пока нет идей.\nПопробуй другой вкус или напиши запрос.",
-            reply_markup=query_keyboard(),
+            user_id=user_id,
+            mode="recipe",
+            category=preferred_taste,
+            query=None,
+            city=context.user_data.get("city"),
         )
+        set_processing_random(user_id, False)
         return
+    last_recipe_id = get_last_suggestions(context).get("recipe")
+    if suggestion_id(recipe) == last_recipe_id:
+        for _ in range(3):
+            with closing(get_conn()) as conn:
+                alt = fetch_random_recipe(conn, chat_id, preferred_taste)
+            if not alt or suggestion_id(alt) != last_recipe_id:
+                recipe = alt or recipe
+                break
     store_queue(context, "recipe", [recipe], {"kind": "random", "taste": recipe.get("category")})
-    context.user_data["stage"] = "query"
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🎲 Ладно, я выберу сам! Вот, что нашёл 👇",
-        reply_markup=query_keyboard(),
-    )
+    category = recipe.get("category") or preferred_taste
+    context.user_data["taste"] = category
+    context.user_data["stage"] = UserFlow.showing_result.name
+    remember_context(user_id, mode=context.user_data.get("mode"), category=category, last_choice=recipe.get("title"))
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    except TelegramError:
+        pass
+    await cozy_delay()
     await send_recipe_card(context, chat_id, recipe)
+    set_processing_random(user_id, False)
 
 
 async def send_random_place(update: Update, context: ContextTypes.DEFAULT_TYPE, taste: Optional[str]):
     chat_id = update.effective_chat.id
-    city = context.user_data.get("city", "Алматы")
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    state = ensure_user_state(user_id)
+    city_state = state.get("city") or context.user_data.get("city")
+    city = city_state or "Алматы"
+    context.user_data["city"] = city
+    remember_context(user_id, city=city)
+    preferred_taste = taste or context.user_data.get("taste") or state.get("category")
     with closing(get_conn()) as conn:
-        place = fetch_random_place(conn, chat_id, city, taste or context.user_data.get("taste"))
+        place = fetch_random_place(conn, chat_id, city, preferred_taste)
     if not place:
-        await send_visual(
+        context.user_data["stage"] = UserFlow.showing_result.name
+        await handle_no_results(
             context,
             chat_id,
-            CATEGORY_MEDIA["not_found"],
-            f"😅 В {city} пока нет подходящих мест.\nПопробуем другой вариант?",
-            reply_markup=query_keyboard(),
+            user_id=user_id,
+            mode="restaurant",
+            category=preferred_taste,
+            query=None,
+            city=city,
         )
+        set_processing_random(user_id, False)
         return
+    last_place_id = get_last_suggestions(context).get("place")
+    if suggestion_id(place) == last_place_id:
+        for _ in range(3):
+            with closing(get_conn()) as conn:
+                alt = fetch_random_place(conn, chat_id, city, preferred_taste)
+            if not alt or suggestion_id(alt) != last_place_id:
+                place = alt or place
+                break
     store_queue(context, "place", [place], {"kind": "random", "taste": place.get("category"), "city": city})
-    context.user_data["stage"] = "query"
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🧠 Думаю, что тебе понравится 👇",
-        reply_markup=query_keyboard(),
-    )
+    category = place.get("category") or preferred_taste
+    context.user_data["stage"] = UserFlow.showing_result.name
+    context.user_data["taste"] = category
+    remember_context(user_id, mode=context.user_data.get("mode"), category=category, last_choice=place.get("name"))
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    except TelegramError:
+        pass
+    await cozy_delay()
     await send_place_card(context, chat_id, place)
+    set_processing_random(user_id, False)
 
 
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -820,25 +1494,83 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text or ""
     chat_id = update.effective_chat.id
-    mode = context.user_data.get("mode", "recipe")
-    taste = context.user_data.get("taste")
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    state = ensure_user_state(user_id)
+    mode = context.user_data.get("mode") or state.get("mode") or "recipe"
+    taste = context.user_data.get("taste") or state.get("category")
+    city = context.user_data.get("city") or state.get("city") or "Астана"
+    context.user_data["city"] = city
+    remember_context(user_id, city=city)
+    normalized_text = normalize(text)
+    taste_button_map = {
+        normalize("🍰 Сладкое"): "sweet",
+        normalize("🍕 Солёное"): "salty",
+        normalize("🌶 Острое"): "spicy",
+        normalize("🥗 Полезное"): "healthy",
+    }
+    direct_category = taste_button_map.get(normalized_text)
+    if direct_category and direct_category != "random":
+        if is_processing_category(user_id):
+            return ASK_QUERY
+        set_processing_category(user_id, True)
+        if direct_category != taste:
+            context.user_data["taste"] = direct_category
+            taste = direct_category
+            remember_context(user_id, category=direct_category)
+            await send_text_safely(
+                context,
+                chat_id,
+                f"🧠 Понял, хочется {taste_label(direct_category)}!",
+                reply_markup=query_keyboard(),
+            )
+        context.user_data["stage"] = UserFlow.waiting_for_input.name
+        prompt = (
+            "Напиши блюдо или ключевое слово (например: «рамэн», «чизкейк», «суп») или жми 🎲"
+            if mode == "recipe"
+            else "Напиши, что хочется (например: «кофейня», «стейки», «суши») или жми 🎲"
+        )
+        visual = CATEGORY_MEDIA.get(direct_category)
+        await send_visual(context, chat_id, visual, prompt, reply_markup=query_keyboard())
+        set_processing_category(user_id, False)
+        return ASK_QUERY
+
+    context.user_data.pop(SKIP_NEXT_MESSAGE, None)
 
     inferred = detect_category_from_text(text)
     if inferred and inferred != "random" and inferred != taste:
-        context.user_data["taste"] = inferred
         taste = inferred
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"🧠 Понял, хочется {taste_label(inferred)}!",
+        context.user_data["taste"] = inferred
+        remember_context(user_id, category=inferred)
+        await send_text_safely(
+            context,
+            chat_id,
+            f"🧠 Понял, хочется {taste_label(inferred)}!",
             reply_markup=query_keyboard(),
         )
 
-    if resolve_category(text) == "random":
+    resolved_category = resolve_category(text)
+    if resolved_category == "random":
+        if is_processing_random(user_id):
+            return ASK_QUERY
+        set_processing_random(user_id, True)
+        context.user_data["stage"] = UserFlow.waiting_for_input.name
+        remember_context(user_id, mode=mode, category=taste)
+        context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+        await send_text_safely(context, chat_id, "Сейчас подберу что-то интересное! 🍀", reply_markup=query_keyboard())
+        await cozy_delay()
         if mode == "recipe":
             await send_random_recipe(update, context, taste)
         else:
             await send_random_place(update, context, taste)
+        set_processing_random(user_id, False)
         return ASK_QUERY
+
+    if not text.strip():
+        await send_text_safely(context, chat_id, "Напиши блюдо или настроение, я помогу найти 👇", reply_markup=query_keyboard())
+        return ASK_QUERY
+
+    context.user_data["stage"] = UserFlow.waiting_for_input.name
+    remember_context(user_id, query=text.strip() or None)
 
     terms = expand_terms(text)
     primary_norm = normalize(text)
@@ -850,61 +1582,94 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not recipes and taste and taste != "random":
                 recipes = fetch_recipes(conn, [], taste, limit=3, primary=primary_norm)
             if not recipes:
-                alt = fetch_random_recipe(conn, chat_id, taste)
-                await send_visual(
+                context.user_data["stage"] = UserFlow.showing_result.name
+                await handle_no_results(
                     context,
                     chat_id,
-                    CATEGORY_MEDIA["not_found"],
-                    f"😅 Не нашёл «{text}».\nСмотри, что могу предложить вместо 👇",
-                    reply_markup=query_keyboard(),
+                    user_id=user_id,
+                    mode="recipe",
+                    category=taste,
+                    query=text,
+                    city=city,
                 )
-                if alt:
-                    store_queue(context, "recipe", [alt], {"kind": "random", "taste": alt.get("category")})
-                    await send_recipe_card(context, chat_id, alt)
+                set_processing_category(user_id, False)
                 return ASK_QUERY
+
             store_queue(
                 context,
                 "recipe",
                 recipes,
                 {"kind": "search", "terms": terms, "taste": taste, "primary": primary_norm},
             )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🍯 Нашёл {taste_label(taste)} по запросу «{text}». Вот что подходит больше всего 👇",
-                reply_markup=query_keyboard(),
+            last_recipe_id = get_last_suggestions(context).get("recipe")
+            first_recipe = None
+            for candidate in recipes:
+                first_recipe = candidate
+                if suggestion_id(candidate) != last_recipe_id:
+                    break
+            first_recipe = first_recipe or recipes[0]
+            category_for_msg = first_recipe.get("category") or taste or detect_category_from_text(
+                first_recipe.get("tags"), first_recipe.get("keywords")
             )
-            await send_recipe_card(context, chat_id, recipes[0])
+            context.user_data["taste"] = category_for_msg
+            remember_context(
+                user_id,
+                mode=mode,
+                category=category_for_msg,
+                last_choice=first_recipe.get("title"),
+            )
+            context.user_data["stage"] = UserFlow.showing_result.name
+            await send_text_safely(context, chat_id, pick_bridge_phrase(), reply_markup=query_keyboard())
+            await cozy_delay()
+            await send_recipe_card(context, chat_id, first_recipe)
         else:
-            city = context.user_data.get("city", "Алматы")
-            places = fetch_restaurants(conn, city, terms, taste, limit=3, primary=primary_norm)
+            city_value = city or "Алматы"
+            places = fetch_restaurants(conn, city_value, terms, taste, limit=3, primary=primary_norm)
             if not places and taste and taste != "random":
-                places = fetch_restaurants(conn, city, [], taste, limit=3, primary=primary_norm)
+                places = fetch_restaurants(conn, city_value, [], taste, limit=3, primary=primary_norm)
             if not places:
-                alt = fetch_random_place(conn, chat_id, city, taste)
-                await send_visual(
+                context.user_data["stage"] = UserFlow.showing_result.name
+                await handle_no_results(
                     context,
                     chat_id,
-                    CATEGORY_MEDIA["not_found"],
-                    f"В {city} не нашёл «{text}». Посмотри, что ещё могу предложить 👇",
-                    reply_markup=query_keyboard(),
+                    user_id=user_id,
+                    mode="restaurant",
+                    category=taste,
+                    query=text,
+                    city=city_value,
                 )
-                if alt:
-                    store_queue(context, "place", [alt], {"kind": "random", "taste": alt.get("category"), "city": city})
-                    await send_place_card(context, chat_id, alt)
+                set_processing_category(user_id, False)
                 return ASK_QUERY
+
             store_queue(
                 context,
                 "place",
                 places,
-                {"kind": "search", "terms": terms, "taste": taste, "city": city, "primary": primary_norm},
+                {"kind": "search", "terms": terms, "taste": taste, "city": city_value, "primary": primary_norm},
             )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🏙 В {city} нашёл {taste_label(taste)} места по запросу «{text}». Смотри, что подходит лучше всего 👇",
-                reply_markup=query_keyboard(),
+            last_place_id = get_last_suggestions(context).get("place")
+            first_place = None
+            for candidate in places:
+                first_place = candidate
+                if suggestion_id(candidate) != last_place_id:
+                    break
+            first_place = first_place or places[0]
+            category_for_msg = first_place.get("category") or taste or detect_category_from_text(
+                first_place.get("tags"), first_place.get("keywords")
             )
-            await send_place_card(context, chat_id, places[0])
+            context.user_data["taste"] = category_for_msg
+            remember_context(
+                user_id,
+                mode=mode,
+                category=category_for_msg,
+                last_choice=first_place.get("name"),
+            )
+            context.user_data["stage"] = UserFlow.showing_result.name
+            await send_text_safely(context, chat_id, pick_bridge_phrase(), reply_markup=query_keyboard())
+            await cozy_delay()
+            await send_place_card(context, chat_id, first_place)
 
+    set_processing_category(user_id, False)
     return ASK_QUERY
 
 
@@ -913,23 +1678,29 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
     current = current_item(context, item_type)
     if current:
         label = taste_label(queue_meta(context, item_type).get("taste"))
+        skip_message = context.user_data.pop(SKIP_NEXT_MESSAGE, False)
         if item_type == "recipe":
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"Окей, подберу что-то ещё {label} 👇",
-                reply_markup=query_keyboard(),
-            )
+            if not skip_message:
+                await send_text_safely(
+                    context,
+                    chat_id,
+                    f"Окей, подберу что-то ещё {label} 👇",
+                    reply_markup=query_keyboard(),
+                )
             await send_recipe_card(context, chat_id, current)
         else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"Есть ещё один вариант {label} 👇",
-                reply_markup=query_keyboard(),
-            )
+            if not skip_message:
+                await send_text_safely(
+                    context,
+                    chat_id,
+                    f"Есть ещё один вариант {label} 👇",
+                    reply_markup=query_keyboard(),
+                )
             await send_place_card(context, chat_id, current)
         return
 
     meta = queue_meta(context, item_type)
+    context.user_data.pop(SKIP_NEXT_MESSAGE, None)
     kind = meta.get("kind")
     with closing(get_conn()) as conn:
         if item_type == "recipe":
@@ -966,6 +1737,15 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
             reply_markup=query_keyboard(),
         )
         return
+    last_id = get_last_suggestions(context).get("recipe" if item_type == "recipe" else "place")
+    if suggestion_id(new_item) == last_id:
+        with closing(get_conn()) as conn:
+            if item_type == "recipe":
+                alt = fetch_random_recipe(conn, chat_id, meta.get("taste"))
+            else:
+                alt = fetch_random_place(conn, chat_id, meta.get("city") or context.user_data.get("city", "Алматы"), meta.get("taste"))
+        if alt and suggestion_id(alt) != last_id:
+            new_item = alt
     store_queue(context, item_type, [new_item], meta)
     if item_type == "recipe":
         await send_recipe_card(context, chat_id, new_item)
@@ -993,7 +1773,7 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "like":
             apply_feedback(conn, chat_id, item, item_type, True)
             await query.edit_message_reply_markup(None)
-            await context.bot.send_message(chat_id=chat_id, text="❤️ Сохранил! Буду подбирать похожее.")
+            await context.bot.send_message(chat_id=chat_id, text=random.choice(LIKE_REPLIES))
             await maybe_send_hint(context, chat_id)
             await next_item(context, chat_id, item_type)
             return
@@ -1001,6 +1781,10 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             apply_feedback(conn, chat_id, item, item_type, False)
             await query.edit_message_reply_markup(None)
             await context.bot.send_message(chat_id=chat_id, text="Окей, запомнил что не зашло 👎")
+            await cozy_delay()
+            await send_text_safely(context, chat_id, "Сейчас покажу другой вариант 👇", reply_markup=query_keyboard())
+            await cozy_delay()
+            context.user_data[SKIP_NEXT_MESSAGE] = True
             await next_item(context, chat_id, item_type)
             return
         if action == "next":
@@ -1045,11 +1829,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def configure_commands(app: Application):
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Запустить диалог заново"),
+                BotCommand("help", "Подсказка по функциям"),
+                BotCommand("favorites", "Показать избранные рецепты"),
+            ]
+        )
+    except TelegramError as exc:
+        log.warning("Не удалось обновить команды бота: %s", exc)
+
+
 def main():
     init_db()
     ensure_synonyms()
     request = HTTPXRequest(connect_timeout=10, read_timeout=30, write_timeout=30, pool_timeout=10)
     app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+    app.post_init = configure_commands
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1069,8 +1867,10 @@ def main():
         allow_reentry=True,
     )
 
+    app.add_handler(CommandHandler("ask", ask_ai))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(feedback_handler, pattern="^(recipe|place):"))
+    app.add_handler(CallbackQueryHandler(ai_feedback_callback, pattern="^ai_(like|dislike)\\|"))
     app.add_handler(CommandHandler("favorites", favorites))
     app.add_handler(CommandHandler("help", help_cmd))
 
