@@ -20,6 +20,17 @@ _model: Optional[genai.GenerativeModel] = None
 _MARKDOWN_PATTERN = re.compile(r"[*_`#>~]+")
 
 
+_DIRECT_FORMAT_INSTRUCTIONS = (
+    "Ты — кулинарный ассистент FindFood. Отвечай по-русски. "
+    "Сформируй ответ строго в формате:\n"
+    "🍽 Название блюда или места (без лишних вступлений)\n"
+    "🧂 Ингредиенты: или Основное — перечисли на отдельных строках через тире\n"
+    "📝 Шаги: дай до 4 коротких шагов, пронумерованных 1. 2. 3. 4.\n"
+    "Не используй Markdown-разметку и эмодзи кроме предложенных, не добавляй поздравлений или лишних пояснений."
+    " Если запрос не про еду, ответь коротко и предложи задать гастрономический вопрос."
+)
+
+
 def init_ai_service(api_key: Optional[str], model_name: str) -> None:
     """Configure Gemini model once at startup."""
 
@@ -42,7 +53,7 @@ def is_ai_available() -> bool:
     return _model is not None
 
 
-async def ask_ai(prompt: str) -> str:
+async def ask_ai(prompt: str, *, mode: str = "default") -> str:
     if not _model:
         raise RuntimeError("Gemini API не настроен.")
 
@@ -65,6 +76,10 @@ async def ask_ai(prompt: str) -> str:
         return ""
 
     raw_text = await loop.run_in_executor(None, _call_model)
+    if mode == "structured":
+        return clean_structured_text(raw_text)
+    if mode == "raw":
+        return (raw_text or "").strip()
     return clean_ai_text(raw_text)
 
 
@@ -84,6 +99,15 @@ def clean_ai_text(text: Optional[str]) -> str:
     compact = re.sub(r"\.(\s*)(?=[А-ЯA-Z])", ".\n\n", compact)
     compact = re.sub(r"\n{3,}", "\n\n", compact)
     return compact.strip()
+
+
+def clean_structured_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    cleaned = _MARKDOWN_PATTERN.sub("", text)
+    cleaned = re.sub(r"[ \t]+$", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 CATEGORY_TITLES = {
@@ -145,4 +169,23 @@ def build_recommendation_prompt(
         "\n2) Вторая строка — что это за вариант и из чего он состоит или чем привлекает."
         "\n3) Третья строка — короткий совет, как насладиться выбором." 
         "\nНе упоминай категорию и не используй Markdown. Если вопрос не про еду, вежливо направь к выбору блюда или места."
+    )
+
+
+def build_direct_prompt(question: str) -> str:
+    query = question.strip()
+    return (
+        f"{_DIRECT_FORMAT_INSTRUCTIONS}\n\n"
+        f"Запрос: {query}"
+    )
+
+
+def build_direct_refinement_prompt(question: str, previous_answer: str) -> str:
+    query = question.strip()
+    prev = previous_answer.strip()
+    return (
+        f"{_DIRECT_FORMAT_INSTRUCTIONS}\n\n"
+        f"Запрос: {query}\n"
+        f"Предыдущий ответ не подошёл пользователю:\n{prev}\n"
+        "Сформируй новый вариант, сохрани формат и сделай его более точным."
     )
