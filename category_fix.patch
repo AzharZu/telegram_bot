@@ -1,0 +1,717 @@
+diff --git a/main.py b/main.py
+index 5cb56e0..ac675ce 100644
+--- a/main.py
++++ b/main.py
+@@ -86,6 +86,7 @@ AI_LOG_PATH = "ai_logs.txt"
+ PROCESSING_RANDOM = "processing_random"
+ PROCESSING_CATEGORY = "processing_category"
+ LAST_SUGGESTION = "last_suggestion"
++SELECTED_CATEGORY_KEY = "selected_category"
+ SKIP_NEXT_MESSAGE = "skip_next_intro"
+ DEFAULT_DELAY_RANGE = (0.8, 1.2)
+ 
+@@ -208,22 +209,45 @@ CATEGORY_HINTS = {
+     "маффин": "sweet",
+     "кофе": "sweet",
+     "кофей": "sweet",
++    "sweet": "sweet",
++    "dessert": "sweet",
++    "сладкий": "sweet",
++    "сладкая": "sweet",
++    "сладкое": "sweet",
++    "сладень": "sweet",
+     "рамэн": "spicy",
+     "рамен": "spicy",
+     "лапша": "spicy",
+     "том ям": "spicy",
+     "чили": "spicy",
++    "spicy": "spicy",
++    "спайси": "spicy",
++    "азиат": "spicy",
++    "азиатск": "spicy",
++    "острый": "spicy",
++    "острое": "spicy",
++    "острень": "spicy",
+     "бургер": "salty",
+     "пицца": "salty",
+     "буррито": "salty",
+     "тако": "salty",
+     "стейк": "salty",
+     "гриль": "salty",
++    "солен": "salty",
++    "солён": "salty",
++    "сытн": "salty",
+     "боул": "healthy",
+     "салат": "healthy",
+     "овсян": "healthy",
+-    "здоров": "healthy",
+     "авокад": "healthy",
++    "здоровое": "healthy",
++    "здоровый": "healthy",
++    "здоровая": "healthy",
++    "полезное": "healthy",
++    "полезный": "healthy",
++    "полезная": "healthy",
++    "фитнес": "healthy",
++    "healthy": "healthy",
+ }
+ 
+ DEFAULT_TASTES = ("sweet", "salty", "spicy", "healthy")
+@@ -504,25 +528,16 @@ def canonicalize_city(raw: Optional[str]) -> Optional[str]:
+         return text
+     try:
+         with closing(get_conn()) as conn:
+-            row = conn.execute(
+-                "SELECT city FROM restaurants WHERE LOWER(city)=? COLLATE NOCASE LIMIT 1",
+-                (norm,),
+-            ).fetchone()
+-        if row:
+-            return row["city"]
+-    except sqlite3.Error:
+-        pass
+-    like = "%" + norm.replace(" ", "%") + "%"
+-    try:
+-        with closing(get_conn()) as conn:
+-            row = conn.execute(
+-                "SELECT city FROM restaurants WHERE LOWER(city) LIKE ? LIMIT 1",
+-                (like,),
+-            ).fetchone()
+-        if row:
+-            return row["city"]
++            rows = conn.execute("SELECT DISTINCT city FROM restaurants WHERE city IS NOT NULL").fetchall()
+     except sqlite3.Error:
+-        pass
++        rows = []
++    norm_map = {normalize(row["city"]): row["city"] for row in rows if row["city"]}
++    direct = norm_map.get(norm)
++    if direct:
++        return direct
++    for city_norm, original in norm_map.items():
++        if city_norm in norm or norm in city_norm:
++            return original
+     return text.title()
+ 
+ 
+@@ -815,6 +830,17 @@ def reset_session(context: ContextTypes.DEFAULT_TYPE):
+         context.user_data["hinted_categories"] = preserved
+ 
+ 
++def set_selected_category(context: ContextTypes.DEFAULT_TYPE, category: Optional[str]):
++    if category:
++        context.user_data[SELECTED_CATEGORY_KEY] = category
++    else:
++        context.user_data.pop(SELECTED_CATEGORY_KEY, None)
++
++
++def get_selected_category(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
++    return context.user_data.get(SELECTED_CATEGORY_KEY)
++
++
+ def get_user(chat_id: int):
+     with closing(get_conn()) as conn:
+         return conn.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+@@ -844,35 +870,49 @@ def ensure_synonyms():
+             )
+ 
+ 
+-def detect_category_from_text(*values: Optional[str]) -> str:
+-    text = " ".join(filter(None, values)).lower()
++def detect_category_from_text(*values: Optional[str]) -> Optional[str]:
++    chunks: list[str] = []
++    for value in values:
++        if value:
++            chunks.append(str(value))
++    text = " ".join(chunks).strip().lower()
++    if not text:
++        return None
++    compact = text.replace(" ", "")
+     for cat, tokens in TASTE_TOKENS.items():
+-        if any(token.replace(" ", "") in text.replace(" ", "") for token in tokens):
+-            return cat
++        for token in tokens:
++            normalized_token = token.strip().lower().replace(" ", "")
++            if normalized_token and normalized_token in compact:
++                return cat
+     for hint, cat in CATEGORY_HINTS.items():
+-        if hint in text:
++        normalized_hint = hint.strip().lower()
++        if normalized_hint and normalized_hint in text:
+             return cat
+-    words = text.replace(";", " ").replace(",", " ").split()
++    words = (
++        text.replace(";", " ")
++        .replace(",", " ")
++        .replace(".", " ")
++        .replace("!", " ")
++        .replace("?", " ")
++        .split()
++    )
+     for word in words:
+         norm = word.strip()
+         if not norm:
+             continue
+         for hint, cat in CATEGORY_HINTS.items():
+-            if hint in norm:
++            normalized_hint = hint.strip().lower()
++            if normalized_hint and normalized_hint in norm:
+                 return cat
+-        if norm in SYNONYMS:
+-            synonyms = SYNONYMS[norm]
++        synonyms = SYNONYMS.get(norm)
++        if synonyms:
+             for syn in synonyms:
++                syn_norm = syn.strip().lower()
+                 for hint, cat in CATEGORY_HINTS.items():
+-                    if hint in syn:
++                    normalized_hint = hint.strip().lower()
++                    if normalized_hint and normalized_hint in syn_norm:
+                         return cat
+-    if "здоров" in text or "фитнес" in text or "healthy" in text:
+-        return "healthy"
+-    if "слад" in text or "dessert" in text:
+-        return "sweet"
+-    if "остр" in text or "spicy" in text or "азиат" in text:
+-        return "spicy"
+-    return "salty"
++    return None
+ 
+ 
+ def taste_keyboard() -> ReplyKeyboardMarkup:
+@@ -986,7 +1026,14 @@ def resolve_random_category(conn, chat_id: int, fallback: Optional[str]) -> Opti
+     return random.choice(DEFAULT_TASTES)
+ 
+ 
+-def fetch_recipes(conn, terms: list[str], taste: Optional[str], limit: int = 3, primary: Optional[str] = None):
++def fetch_recipes(
++    conn,
++    terms: list[str],
++    taste: Optional[str],
++    limit: int = 3,
++    primary: Optional[str] = None,
++    selected_category: Optional[str] = None,
++):
+     clauses = []
+     filter_params: list = []
+     if terms:
+@@ -999,11 +1046,16 @@ def fetch_recipes(conn, terms: list[str], taste: Optional[str], limit: int = 3,
+             term_clauses.append("(lower(title) LIKE ? OR lower(tags) LIKE ? OR lower(keywords) LIKE ?)")
+             filter_params.extend([like, like, like])
+         clauses.append("(" + " OR ".join(term_clauses) + ")")
+-    if taste and taste != "random":
+-        like = f"%{taste.lower()}%"
+-        clauses.append("(LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ?)")
+-        filter_params.extend([like, like, like])
+-    where = "WHERE " + " AND ".join(clauses) if clauses else ""
++    category_filter = selected_category or (taste if taste and taste != "random" else None)
++    fallback_clause = None
++    fallback_params: list = []
++    if category_filter:
++        normalized_category = category_filter.lower()
++        clauses.append("LOWER(category)=?")
++        filter_params.append(normalized_category)
++        like = f"%{normalized_category}%"
++        fallback_clause = "(LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ?)"
++        fallback_params = [like, like, like]
+     score_expr = "0"
+     score_params: list = []
+     primary_norm = normalize(primary) if primary else ""
+@@ -1011,18 +1063,38 @@ def fetch_recipes(conn, terms: list[str], taste: Optional[str], limit: int = 3,
+         like = f"%{primary_norm}%"
+         score_expr = "(CASE WHEN lower(title) LIKE ? THEN 3 WHEN lower(tags) LIKE ? THEN 2 WHEN lower(keywords) LIKE ? THEN 1 ELSE 0 END)"
+         score_params = [like, like, like]
+-    sql = f"SELECT *, {score_expr} AS match_score FROM recipes {where} ORDER BY match_score DESC, likes DESC, RANDOM() LIMIT ?"
+-    params = score_params + filter_params + [limit]
+-    return list(map(row_dict, conn.execute(sql, params).fetchall()))
+-
+ 
+-def fetch_restaurants(conn, city: str, terms: list[str], taste: Optional[str], limit: int = 3, primary: Optional[str] = None):
+-    city_norm = normalize(city)
++    def run_query(active_clauses: list[str], active_params: list) -> list[dict]:
++        where = "WHERE " + " AND ".join(active_clauses) if active_clauses else ""
++        sql = f"SELECT *, {score_expr} AS match_score FROM recipes {where} ORDER BY match_score DESC, likes DESC, RANDOM() LIMIT ?"
++        params = score_params + active_params + [limit]
++        return list(map(row_dict, conn.execute(sql, params).fetchall()))
++
++    rows = run_query(clauses, filter_params)
++    if rows or not category_filter or selected_category or not fallback_clause:
++        return rows
++
++    fallback_clauses = clauses[:-1]
++    fallback_params_all = filter_params[:-1]
++    fallback_clauses.append(fallback_clause)
++    fallback_params_all.extend(fallback_params)
++    return run_query(fallback_clauses, fallback_params_all)
++
++
++def fetch_restaurants(
++    conn,
++    city: str,
++    terms: list[str],
++    taste: Optional[str],
++    limit: int = 3,
++    primary: Optional[str] = None,
++    selected_category: Optional[str] = None,
++):
+     clauses = []
+     filter_params: list = []
+-    if city_norm:
+-        clauses.append("LOWER(city) LIKE ?")
+-        filter_params.append(f"%{city_norm}%")
++    if city:
++        clauses.append("city=?")
++        filter_params.append(city)
+     taste_hints = {
+         "sweet": ["слад", "десерт", "кофе", "кофей", "sweet"],
+         "salty": ["сол", "сыт", "гриль", "бургер", "пицц", "salty"],
+@@ -1039,7 +1111,17 @@ def fetch_restaurants(conn, city: str, terms: list[str], taste: Optional[str], l
+             term_clauses.append("(lower(name) LIKE ? OR lower(tags) LIKE ? OR lower(keywords) LIKE ? OR lower(cuisine) LIKE ?)")
+             filter_params.extend([like, like, like, like])
+         clauses.append("(" + " OR ".join(term_clauses) + ")")
+-    if taste and taste != "random":
++    category_filter = selected_category or (taste if taste and taste != "random" else None)
++    fallback_clause = None
++    fallback_params: list = []
++    if category_filter:
++        normalized_category = category_filter.lower()
++        clauses.append("LOWER(category)=?")
++        filter_params.append(normalized_category)
++        like = f"%{normalized_category}%"
++        fallback_clause = "(LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(cuisine) LIKE ?)"
++        fallback_params = [like, like, like, like]
++    elif taste and taste != "random":
+         hints = taste_hints.get(taste, [taste])
+         hint_clauses = []
+         for hint in hints:
+@@ -1052,7 +1134,6 @@ def fetch_restaurants(conn, city: str, terms: list[str], taste: Optional[str], l
+         clauses.append("(" + " OR ".join(hint_clauses) + ")")
+     if not clauses:
+         clauses.append("1=1")
+-    where = "WHERE " + " AND ".join(clauses)
+     score_expr = "0"
+     score_params: list = []
+     primary_norm = normalize(primary) if primary else ""
+@@ -1060,96 +1141,143 @@ def fetch_restaurants(conn, city: str, terms: list[str], taste: Optional[str], l
+         like = f"%{primary_norm}%"
+         score_expr = "(CASE WHEN lower(name) LIKE ? THEN 3 WHEN lower(tags) LIKE ? THEN 2 WHEN lower(keywords) LIKE ? THEN 1 ELSE 0 END)"
+         score_params = [like, like, like]
+-    sql = f"SELECT *, {score_expr} AS match_score FROM restaurants {where} ORDER BY match_score DESC, rating DESC, RANDOM() LIMIT ?"
+-    params = score_params + filter_params + [limit]
+-    return list(map(row_dict, conn.execute(sql, params).fetchall()))
+ 
++    def run_query(active_clauses: list[str], active_params: list) -> list[dict]:
++        where = "WHERE " + " AND ".join(active_clauses)
++        sql = f"SELECT *, {score_expr} AS match_score FROM restaurants {where} ORDER BY match_score DESC, rating DESC, RANDOM() LIMIT ?"
++        params = score_params + active_params + [limit]
++        return list(map(row_dict, conn.execute(sql, params).fetchall()))
++
++    rows = run_query(clauses, filter_params)
++    if rows or not category_filter or selected_category or not fallback_clause:
++        return rows
+ 
+-def fetch_random_recipe(conn, chat_id: int, taste: Optional[str]) -> Optional[dict]:
+-    category = resolve_random_category(conn, chat_id, taste)
+-    params = []
+-    sql = "SELECT * FROM recipes"
++    fallback_clauses = clauses[:-1]
++    fallback_params_all = filter_params[:-1]
++    fallback_clauses.append(fallback_clause)
++    fallback_params_all.extend(fallback_params)
++    return run_query(fallback_clauses, fallback_params_all)
++
++
++def fetch_random_recipe(
++    conn,
++    chat_id: int,
++    taste: Optional[str],
++    *,
++    selected_category: Optional[str] = None,
++) -> Optional[dict]:
++    category = selected_category or resolve_random_category(conn, chat_id, taste)
++    clauses: list[str] = []
++    params: list = []
+     if category and category != "random":
++        clauses.append("LOWER(category)=?")
++        params.append(category.lower())
++    base_sql = "SELECT * FROM recipes"
++    where = " WHERE " + " AND ".join(clauses) if clauses else ""
++    row = conn.execute(f"{base_sql}{where} ORDER BY RANDOM() LIMIT 1", params).fetchone()
++    if not row and category and category != "random" and not selected_category:
++        clauses_without_category = clauses[:-1]
++        params_without_category = params[:-1]
+         like = f"%{category.lower()}%"
+-        sql += " WHERE (LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ?)"
+-        params.extend([like, like, like])
+-    sql += " ORDER BY RANDOM() LIMIT 1"
+-    row = conn.execute(sql, params).fetchone()
+-    if category and category != "random" and row and not row["category"]:
+-        detected = detect_category_from_text(row.get("tags"), row.get("keywords"))
+-        if detected != category:
+-            row = None
+-    attempts = 0
+-    while category and category != "random" and not row and attempts < 5:
+-        row = conn.execute(
+-            "SELECT * FROM recipes WHERE LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ? ORDER BY RANDOM() LIMIT 1",
+-            [like, like, like],
+-        ).fetchone()
+-        attempts += 1
++        fallback_clause = "(LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ?)"
++        clauses_without_category.append(fallback_clause)
++        params_without_category.extend([like, like, like])
++        where = " WHERE " + " AND ".join(clauses_without_category) if clauses_without_category else ""
++        row = conn.execute(f"{base_sql}{where} ORDER BY RANDOM() LIMIT 1", params_without_category).fetchone()
+     data = row_dict(row)
+-    if data and not data.get("category"):
+-        data["category"] = category or detect_category_from_text(data.get("tags"), data.get("keywords"))
+-    if data and category and category != "random":
+-        data["category"] = category
++    if data:
++        if not data.get("category"):
++            detected_category = detect_category_from_text(data.get("tags"), data.get("keywords"))
++            if category and category != "random":
++                data["category"] = category
++            elif detected_category:
++                data["category"] = detected_category
++        elif category and category != "random":
++            data["category"] = category
+     return data
+ 
+ 
+-def fetch_random_place(conn, chat_id: int, city: str, taste: Optional[str]) -> Optional[dict]:
+-    category = resolve_random_category(conn, chat_id, taste)
+-    city_norm = normalize(city)
++def fetch_random_place(
++    conn,
++    chat_id: int,
++    city: str,
++    taste: Optional[str],
++    *,
++    selected_category: Optional[str] = None,
++) -> Optional[dict]:
++    category = selected_category or resolve_random_category(conn, chat_id, taste)
++
+     clauses = []
+     params: list = []
+-    if city_norm:
+-        clauses.append("LOWER(city) LIKE ?")
+-        params.append(f"%{city_norm}%")
++
++    if city:
++        clauses.append("city=?")
++        params.append(city)
+     else:
+         clauses.append("1=1")
++
++    if category and category != "random":
++        clauses.append("LOWER(category)=?")
++        params.append(category.lower())
++
+     base_sql = "SELECT * FROM restaurants WHERE " + " AND ".join(clauses)
+-    like = None
++
+     if category and category != "random":
+-        like = f"%{category.lower()}%"
+-        sql = base_sql + " AND (LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ?) ORDER BY rating DESC, RANDOM() LIMIT 1"
+-        row = conn.execute(sql, params + [like, like, like]).fetchone()
++        row = conn.execute(base_sql + " ORDER BY rating DESC, RANDOM() LIMIT 1", params).fetchone()
++        if not row and not selected_category:
++            clauses_without_category = clauses[:-1]
++            params_without_category = params[:-1]
++            like = f"%{category.lower()}%"
++            fallback_clause = "(LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(cuisine) LIKE ?)"
++            clauses_without_category.append(fallback_clause)
++            params_without_category.extend([like, like, like, like])
++            fallback_sql = "SELECT * FROM restaurants WHERE " + " AND ".join(clauses_without_category)
++            row = conn.execute(fallback_sql + " ORDER BY rating DESC, RANDOM() LIMIT 1", params_without_category).fetchone()
+     else:
+         row = conn.execute(base_sql + " ORDER BY rating DESC, RANDOM() LIMIT 1", params).fetchone()
++
++    # ⛔ ВАЖНО: не прыгать на другие города/категории, если в этом городе ничего нет
+     if not row:
+-        if category and category != "random":
+-            row = conn.execute(
+-                "SELECT * FROM restaurants WHERE LOWER(category) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(keywords) LIKE ? ORDER BY rating DESC, RANDOM() LIMIT 1",
+-                (like, like, like),
+-            ).fetchone()
+-        if not row:
+-            row = conn.execute("SELECT * FROM restaurants ORDER BY rating DESC, RANDOM() LIMIT 1").fetchone()
++        return None
++
+     data = row_dict(row)
+-    if data and not data.get("category"):
+-        data["category"] = category or detect_category_from_text(data.get("tags"), data.get("keywords"))
+-    if data and category and category != "random":
+-        data["category"] = category
++    if data:
++        if not data.get("category"):
++            detected_category = detect_category_from_text(data.get("tags"), data.get("keywords"))
++            if category and category != "random":
++                data["category"] = category
++            elif detected_category:
++                data["category"] = detected_category
++        elif category and category != "random":
++            data["category"] = category
+     return data
+ 
+ 
+ def apply_feedback(conn, chat_id: int, item: dict, item_type: str, liked: bool):
+     if not item:
+         return
+-    category = item.get("category") or detect_category_from_text(item.get("category"), item.get("tags"), item.get("keywords"))
+-    conn.execute(
+-        """
+-        INSERT INTO user_history(chat_id, item_id, item_type, category, liked)
+-        VALUES (?,?,?,?,?)
+-        """,
+-        (chat_id, item.get("id"), item_type, category, 1 if liked else 0),
+-    )
+-    conn.execute(
+-        """
+-        INSERT INTO user_tastes(chat_id, category, likes, dislikes)
+-        VALUES (?,?,?,?)
+-        ON CONFLICT(chat_id, category) DO UPDATE SET
+-            likes = likes + excluded.likes,
+-            dislikes = dislikes + excluded.dislikes,
+-            updated_at = CURRENT_TIMESTAMP
+-        """,
+-        (chat_id, category, 1 if liked else 0, 0 if liked else 1),
+-    )
++    raw_category = item.get("category")
++    primary_category = raw_category.strip() if isinstance(raw_category, str) else raw_category
++    category = primary_category or detect_category_from_text(item.get("category"), item.get("tags"), item.get("keywords"))
++    if category:
++        conn.execute(
++            """
++            INSERT INTO user_history(chat_id, item_id, item_type, category, liked)
++            VALUES (?,?,?,?,?)
++            """,
++            (chat_id, item.get("id"), item_type, category, 1 if liked else 0),
++        )
++        conn.execute(
++            """
++            INSERT INTO user_tastes(chat_id, category, likes, dislikes)
++            VALUES (?,?,?,?)
++            ON CONFLICT(chat_id, category) DO UPDATE SET
++                likes = likes + excluded.likes,
++                dislikes = dislikes + excluded.dislikes,
++                updated_at = CURRENT_TIMESTAMP
++            """,
++            (chat_id, category, 1 if liked else 0, 0 if liked else 1),
++        )
+     if item_type == "recipe":
+         if liked:
+             conn.execute(
+@@ -1490,6 +1618,7 @@ async def handle_taste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     set_processing_category(user_id, True)
+ 
+     if category == "random":
++        set_selected_category(context, None)
+         fallback_category = state.get("category") or context.user_data.get("taste")
+         if is_processing_random(user_id):
+             set_processing_category(user_id, False)
+@@ -1516,6 +1645,7 @@ async def handle_taste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         return ASK_QUERY
+ 
+     context.user_data["taste"] = category
++    set_selected_category(context, category)
+     context.user_data["stage"] = UserFlow.waiting_for_input.name
+     remember_context(user_id, category=category, last_action="category_select")
+ 
+@@ -1672,8 +1802,9 @@ async def send_random_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE,
+     user_id = update.effective_user.id if update.effective_user else chat_id
+     state = ensure_user_state(user_id)
+     preferred_taste = taste or context.user_data.get("taste") or state.get("category")
++    explicit_category = get_selected_category(context)
+     with closing(get_conn()) as conn:
+-        recipe = fetch_random_recipe(conn, chat_id, preferred_taste)
++        recipe = fetch_random_recipe(conn, chat_id, preferred_taste, selected_category=explicit_category)
+     if not recipe:
+         context.user_data["stage"] = UserFlow.showing_result.name
+         await handle_no_results(
+@@ -1691,7 +1822,7 @@ async def send_random_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE,
+     if suggestion_id(recipe) == last_recipe_id:
+         for _ in range(3):
+             with closing(get_conn()) as conn:
+-                alt = fetch_random_recipe(conn, chat_id, preferred_taste)
++                alt = fetch_random_recipe(conn, chat_id, preferred_taste, selected_category=explicit_category)
+             if not alt or suggestion_id(alt) != last_recipe_id:
+                 recipe = alt or recipe
+                 break
+@@ -1725,8 +1856,9 @@ async def send_random_place(update: Update, context: ContextTypes.DEFAULT_TYPE,
+     context.user_data["city"] = city_canonical
+     remember_context(user_id, city=city_canonical)
+     preferred_taste = taste or context.user_data.get("taste") or state.get("category")
++    explicit_category = get_selected_category(context)
+     with closing(get_conn()) as conn:
+-        place = fetch_random_place(conn, chat_id, city_canonical, preferred_taste)
++        place = fetch_random_place(conn, chat_id, city_canonical, preferred_taste, selected_category=explicit_category)
+     if not place:
+         context.user_data["stage"] = UserFlow.showing_result.name
+         await handle_no_results(
+@@ -1744,7 +1876,13 @@ async def send_random_place(update: Update, context: ContextTypes.DEFAULT_TYPE,
+     if suggestion_id(place) == last_place_id:
+         for _ in range(3):
+             with closing(get_conn()) as conn:
+-                alt = fetch_random_place(conn, chat_id, city_canonical, preferred_taste)
++                alt = fetch_random_place(
++                    conn,
++                    chat_id,
++                    city_canonical,
++                    preferred_taste,
++                    selected_category=explicit_category,
++                )
+             if not alt or suggestion_id(alt) != last_place_id:
+                 place = alt or place
+                 break
+@@ -1779,6 +1917,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     state = ensure_user_state(user_id)
+     mode = context.user_data.get("mode") or state.get("mode") or "recipe"
+     taste = context.user_data.get("taste") or state.get("category")
++    explicit_category = get_selected_category(context)
+     city = context.user_data.get("city") or state.get("city") or "Астана"
+     context.user_data["city"] = city
+     remember_context(user_id, city=city)
+@@ -1796,6 +1935,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         if is_processing_category(user_id):
+             return ASK_QUERY
+         set_processing_category(user_id, True)
++        set_selected_category(context, direct_category)
+         if direct_category != taste:
+             context.user_data["taste"] = direct_category
+             taste = direct_category
+@@ -1820,9 +1960,11 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+ 
+     inferred = detect_category_from_text(text)
+-    if inferred and inferred != "random" and inferred != taste:
++    # Не переезжаем уже выбранную категорию кнопкой — только если ещё не было taste
++    if inferred and inferred != "random" and not taste:
+         taste = inferred
+         context.user_data["taste"] = inferred
++        set_selected_category(context, inferred)
+         remember_context(user_id, category=inferred, last_action="category_inferred")
+         await send_text_safely(
+             context,
+@@ -1862,9 +2004,23 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+ 
+     with closing(get_conn()) as conn:
+         if mode == "recipe":
+-            recipes = fetch_recipes(conn, terms, taste, limit=3, primary=primary_norm)
++            recipes = fetch_recipes(
++                conn,
++                terms,
++                taste,
++                limit=3,
++                primary=primary_norm,
++                selected_category=explicit_category,
++            )
+             if not recipes and taste and taste != "random":
+-                recipes = fetch_recipes(conn, [], taste, limit=3, primary=primary_norm)
++                recipes = fetch_recipes(
++                    conn,
++                    [],
++                    taste,
++                    limit=3,
++                    primary=primary_norm,
++                    selected_category=explicit_category,
++                )
+             if not recipes:
+                 context.user_data["stage"] = UserFlow.showing_result.name
+                 await handle_no_results(
+@@ -1909,9 +2065,25 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+             await send_recipe_card(context, chat_id, first_recipe)
+         else:
+             city_value = canonicalize_city(city or "Алматы") or "Алматы"
+-            places = fetch_restaurants(conn, city_value, terms, taste, limit=3, primary=primary_norm)
++            places = fetch_restaurants(
++                conn,
++                city_value,
++                terms,
++                taste,
++                limit=3,
++                primary=primary_norm,
++                selected_category=explicit_category,
++            )
+             if not places and taste and taste != "random":
+-                places = fetch_restaurants(conn, city_value, [], taste, limit=3, primary=primary_norm)
++                places = fetch_restaurants(
++                    conn,
++                    city_value,
++                    [],
++                    taste,
++                    limit=3,
++                    primary=primary_norm,
++                    selected_category=explicit_category,
++                )
+             if not places:
+                 context.user_data["stage"] = UserFlow.showing_result.name
+                 await handle_no_results(
+@@ -1988,10 +2160,16 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
+     meta = queue_meta(context, item_type)
+     context.user_data.pop(SKIP_NEXT_MESSAGE, None)
+     kind = meta.get("kind")
++    explicit_category = get_selected_category(context)
+     with closing(get_conn()) as conn:
+         if item_type == "recipe":
+             if kind == "random":
+-                new_item = fetch_random_recipe(conn, chat_id, meta.get("taste"))
++                new_item = fetch_random_recipe(
++                    conn,
++                    chat_id,
++                    meta.get("taste"),
++                    selected_category=explicit_category,
++                )
+             else:
+                 new_item = fetch_recipes(
+                     conn,
+@@ -1999,12 +2177,19 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
+                     meta.get("taste"),
+                     limit=1,
+                     primary=meta.get("primary"),
++                    selected_category=explicit_category,
+                 )
+                 new_item = new_item[0] if new_item else None
+         else:
+             city = meta.get("city") or context.user_data.get("city", "Алматы")
+             if kind == "random":
+-                new_item = fetch_random_place(conn, chat_id, city, meta.get("taste"))
++                new_item = fetch_random_place(
++                    conn,
++                    chat_id,
++                    city,
++                    meta.get("taste"),
++                    selected_category=explicit_category,
++                )
+             else:
+                 new_items = fetch_restaurants(
+                     conn,
+@@ -2013,6 +2198,7 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
+                     meta.get("taste"),
+                     limit=1,
+                     primary=meta.get("primary"),
++                    selected_category=explicit_category,
+                 )
+                 new_item = new_items[0] if new_items else None
+     if not new_item:
+@@ -2027,9 +2213,20 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
+     if suggestion_id(new_item) == last_id:
+         with closing(get_conn()) as conn:
+             if item_type == "recipe":
+-                alt = fetch_random_recipe(conn, chat_id, meta.get("taste"))
++                alt = fetch_random_recipe(
++                    conn,
++                    chat_id,
++                    meta.get("taste"),
++                    selected_category=explicit_category,
++                )
+             else:
+-                alt = fetch_random_place(conn, chat_id, meta.get("city") or context.user_data.get("city", "Алматы"), meta.get("taste"))
++                alt = fetch_random_place(
++                    conn,
++                    chat_id,
++                    meta.get("city") or context.user_data.get("city", "Алматы"),
++                    meta.get("taste"),
++                    selected_category=explicit_category,
++                )
+         if alt and suggestion_id(alt) != last_id:
+             new_item = alt
+     store_queue(context, item_type, [new_item], meta)
