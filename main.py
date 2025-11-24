@@ -3,12 +3,14 @@ import os
 import random
 import re
 import logging
+import io
 import sqlite3
 import uuid
 from datetime import datetime
 from contextlib import closing
 from enum import IntEnum
 from typing import Dict, Iterable, Optional
+from urllib.parse import quote_plus
 
 import ai_service
 from dotenv import load_dotenv
@@ -35,6 +37,7 @@ from telegram.ext import (
     Application,
 )
 from telegram.request import HTTPXRequest
+import httpx
 
 from db import (
     get_conn,
@@ -58,6 +61,21 @@ if GEMINI_API_KEY:
     ai_service.init_ai_service(GEMINI_API_KEY, GEMINI_MODEL_NAME)
 else:
     logging.warning("⚠️ GEMINI_API_KEY отсутствует. Команда /ask работать не будет.")
+GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY")
+if not GOOGLE_PLACES_KEY:
+    logging.warning("⚠️ GOOGLE_PLACES_KEY отсутствует. Поиск реальных заведений недоступен.")
+GOOGLE_TASTE_QUERIES = {
+    "sweet": "десерты кондитерская кафе",
+    "salty": "пицца бургер паста гриль",
+    "spicy": "острое азиатская тайская корейская кухня",
+    "healthy": "боулы здоровая еда салаты веган",
+}
+GOOGLE_ALLOWED_TYPES = {
+    "sweet": {"bakery", "cafe", "dessert"},
+    "salty": {"restaurant", "pizza", "grill"},
+    "spicy": {"restaurant", "thai", "korean", "asian"},
+    "healthy": {"restaurant", "health", "vegetarian", "bowls"},
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("FindFood4")
@@ -89,6 +107,8 @@ LAST_SUGGESTION = "last_suggestion"
 SELECTED_CATEGORY_KEY = "selected_category"
 SKIP_NEXT_MESSAGE = "skip_next_intro"
 DEFAULT_DELAY_RANGE = (0.8, 1.2)
+GOOGLE_PLACES_ENDPOINT = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+GOOGLE_PHOTO_ENDPOINT = "https://maps.googleapis.com/maps/api/place/photo"
 
 AI_BRIDGE_PHRASES = (
     "🥄 Думаю о чём-то вкусном…",
@@ -408,10 +428,10 @@ def is_last_suggestion(context: ContextTypes.DEFAULT_TYPE, item_type: str, item_
     return suggestions.get(item_type) == item_id
 
 
-def suggestion_id(item: Optional[dict]) -> Optional[int]:
+def suggestion_id(item: Optional[dict]) -> Optional[str]:
     if not item:
         return None
-    return item.get("id")
+    return item.get("id") or item.get("place_id")
 
 
 def log_ai_interaction(user_id: int, question: str, answer: str, status: str):
@@ -467,13 +487,14 @@ def fetch_qa_answer(question: str):
     return row
 
 
-def ai_feedback_keyboard(session_id: str) -> InlineKeyboardMarkup:
+def ai_feedback_keyboard(session_id: str, mode: Optional[str] = None) -> InlineKeyboardMarkup:
+    suffix = f"|{mode}" if mode else ""
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("👍 Нравится", callback_data=f"ai_like|{session_id}"),
-                InlineKeyboardButton("👎 Не нравится", callback_data=f"ai_dislike|{session_id}"),
-                InlineKeyboardButton("🔁 Следующее", callback_data=f"ai_next|{session_id}"),
+                InlineKeyboardButton("👍 Нравится", callback_data=f"ai_like|{session_id}{suffix}"),
+                InlineKeyboardButton("👎 Не нравится", callback_data=f"ai_dislike|{session_id}{suffix}"),
+                InlineKeyboardButton("🔁 Следующее", callback_data=f"ai_next|{session_id}{suffix}"),
             ]
         ]
     )
@@ -649,6 +670,23 @@ async def send_visual(context: ContextTypes.DEFAULT_TYPE, chat_id: int, image: O
                     caption=text,
                     reply_markup=reply_markup,
                 )
+        elif image and image.startswith(("http://", "https://")):
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+                    resp = await client.get(image)
+                resp.raise_for_status()
+                buffer = io.BytesIO(resp.content)
+                filename = os.path.basename(image.split("?")[0]) or "image.jpg"
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(buffer, filename=filename),
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+            except Exception as exc:
+                log.warning("Failed to fetch remote image %s: %s", image, exc)
+                if text:
+                    await send_text_safely(context, chat_id, text, reply_markup=reply_markup)
         elif text:
             await send_text_safely(context, chat_id, text, reply_markup=reply_markup)
     except Forbidden:
@@ -746,6 +784,7 @@ async def handle_ai_question(
         "answer": answer,
         "rejections": prev_session["rejections"] if prev_session else 0,
         "direct_mode": direct_mode,
+        "mode": context.user_data.get("mode"),
     }
     sessions[session_id] = session_record
 
@@ -755,7 +794,7 @@ async def handle_ai_question(
             context,
             chat_id,
             payload,
-            reply_markup=ai_feedback_keyboard(session_id),
+            reply_markup=ai_feedback_keyboard(session_id, context.user_data.get("mode")),
         )
     else:
         formatted = prepare_ai_response(answer)
@@ -769,7 +808,7 @@ async def handle_ai_question(
             context,
             chat_id,
             payload,
-            reply_markup=ai_feedback_keyboard(session_id),
+            reply_markup=ai_feedback_keyboard(session_id, context.user_data.get("mode")),
         )
 
 
@@ -779,7 +818,11 @@ async def ai_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     data = query.data or ""
     if "|" not in data:
         return
-    action, session_id = data.split("|", 1)
+    parts = data.split("|")
+    if len(parts) < 2:
+        return
+    action, session_id = parts[0], parts[1]
+    mode_hint = parts[2] if len(parts) > 2 else None
     sessions = get_ai_sessions(context)
     session = sessions.get(session_id)
     if not session:
@@ -790,6 +833,7 @@ async def ai_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     question = session["question"]
     answer = session["answer"]
     user_id = query.from_user.id
+    chat_id = query.message.chat.id if query.message and query.message.chat else user_id
 
     if action == "ai_like":
         save_ai_feedback(question, answer, user_id, 1)
@@ -813,12 +857,38 @@ async def ai_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         await query.edit_message_reply_markup(None)
         await query.message.reply_text("Понял, попробую сформулировать по-другому 🔄")
+        if (mode_hint or session.get("mode")) == "restaurant":
+            await next_item(context, chat_id, "place")
+            if not current_item(context, "place"):
+                await handle_no_results(
+                    context,
+                    chat_id,
+                    user_id=user_id,
+                    mode="restaurant",
+                    category=context.user_data.get("taste"),
+                    query=None,
+                    city=context.user_data.get("city"),
+                )
+            return
         await handle_ai_question(update, context, question, session_id=session_id)
         return
 
     if action == "ai_next":
         await query.edit_message_reply_markup(None)
         await query.message.reply_text("Хорошо, предложу другой вариант 🔄")
+        if (mode_hint or session.get("mode")) == "restaurant":
+            await next_item(context, chat_id, "place")
+            if not current_item(context, "place"):
+                await handle_no_results(
+                    context,
+                    chat_id,
+                    user_id=user_id,
+                    mode="restaurant",
+                    category=context.user_data.get("taste"),
+                    query=None,
+                    city=context.user_data.get("city"),
+                )
+            return
         await handle_ai_question(update, context, question, session_id=session_id)
         return
 
@@ -1081,7 +1151,7 @@ def fetch_recipes(
     return run_query(fallback_clauses, fallback_params_all)
 
 
-def fetch_restaurants(
+async def fetch_restaurants(
     conn,
     city: str,
     terms: list[str],
@@ -1142,6 +1212,24 @@ def fetch_restaurants(
         score_expr = "(CASE WHEN lower(name) LIKE ? THEN 3 WHEN lower(tags) LIKE ? THEN 2 WHEN lower(keywords) LIKE ? THEN 1 ELSE 0 END)"
         score_params = [like, like, like]
 
+    city_norm = normalize(city)
+    if city_norm and city_norm != normalize("Астана"):
+        taste_for_google = category_filter or (taste if taste and taste != "random" else None)
+        google_results = await google_places_search(city, taste_for_google)
+        if not google_results:
+            google_results = await google_places_search(city, None)
+        if terms:
+            filtered = []
+            for item in google_results:
+                text = normalize(f"{item.get('name','')} {item.get('description','')} {item.get('cuisine','')}")
+                if any(normalize(term) in text for term in terms if term):
+                    filtered.append(item)
+            google_results = filtered or google_results
+        if taste_for_google:
+            for place in google_results:
+                place["category"] = taste_for_google
+        return google_results[:limit]
+
     def run_query(active_clauses: list[str], active_params: list) -> list[dict]:
         where = "WHERE " + " AND ".join(active_clauses)
         sql = f"SELECT *, {score_expr} AS match_score FROM restaurants {where} ORDER BY match_score DESC, rating DESC, RANDOM() LIMIT ?"
@@ -1150,13 +1238,32 @@ def fetch_restaurants(
 
     rows = run_query(clauses, filter_params)
     if rows or not category_filter or selected_category or not fallback_clause:
-        return rows
+        enriched = rows
+    else:
+        fallback_clauses = clauses[:-1]
+        fallback_params_all = filter_params[:-1]
+        fallback_clauses.append(fallback_clause)
+        fallback_params_all.extend(fallback_params)
+        enriched = run_query(fallback_clauses, fallback_params_all)
 
-    fallback_clauses = clauses[:-1]
-    fallback_params_all = filter_params[:-1]
-    fallback_clauses.append(fallback_clause)
-    fallback_params_all.extend(fallback_params)
-    return run_query(fallback_clauses, fallback_params_all)
+    if len(enriched) >= limit or not city:
+        return enriched
+
+    taste_for_google = category_filter or (taste if taste and taste != "random" else None)
+    google_results = await google_places_search(city, taste_for_google)
+    if not google_results:
+        return enriched
+
+    seen = {normalize(row.get("name")) for row in enriched if row.get("name")}
+    for place in google_results:
+        key = normalize(place.get("name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        enriched.append(place)
+        if len(enriched) >= limit:
+            break
+    return enriched
 
 
 def fetch_random_recipe(
@@ -1197,16 +1304,80 @@ def fetch_random_recipe(
     return data
 
 
-def fetch_random_place(
+def _google_queue(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.chat_data.setdefault("google_queue", {})
+
+
+def _google_queue_key(city: str, category: Optional[str]) -> str:
+    return f"{normalize(city)}|{(category or '').lower()}"
+
+
+async def ai_fallback_place(city: str, taste: Optional[str]) -> Optional[dict]:
+    """AI fallback карточка, если Google ничего не дал."""
+    if not ai_service.is_ai_available():
+        return None
+    taste_label_ai = taste_prompt_label(taste)
+    prompt = (
+        f"Предложи одно интересное заведение в городе {city} в стиле {taste_label_ai}. "
+        "Коротко укажи название, тип кухни и адрес. Без вымышленных оценок."
+    )
+    try:
+        answer = await generate_ai_answer(prompt, 0, prompt)
+    except Exception:
+        return None
+    name = answer.split("\n", 1)[0].strip(" -•")
+    return {
+        "id": str(uuid.uuid4()),
+        "name": name or "Новое место",
+        "address": city,
+        "rating": None,
+        "photo_url": None,
+        "description": answer.strip(),
+        "category": taste if taste and taste != "random" else None,
+        "latitude": None,
+        "longitude": None,
+        "is_open": None,
+        "source": "ai",
+        "city": city,
+    }
+
+
+async def fetch_random_place(
     conn,
     chat_id: int,
     city: str,
     taste: Optional[str],
     *,
     selected_category: Optional[str] = None,
-) -> Optional[dict]:
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+) -> list[dict]:
     category = selected_category or resolve_random_category(conn, chat_id, taste)
+    city_norm = normalize(city)
 
+    # Для любых городов, кроме Астаны, только Google (с широким повторным запросом)
+    if city_norm and city_norm != normalize("Астана"):
+        category_for_google = category if category and category != "random" else None
+        if context:
+            queue = _google_queue(context)
+            key = _google_queue_key(city, category_for_google)
+            bucket = queue.get(key, [])
+            if bucket:
+                return [bucket.pop(0)]
+        google_results = await google_places_search(city, category_for_google)
+        if not google_results:
+            google_results = await google_places_search(city, None)
+        if category_for_google:
+            for place in google_results:
+                place["category"] = category_for_google
+        if context and google_results:
+            queue = _google_queue(context)
+            key = _google_queue_key(city, category_for_google)
+            queue[key] = google_results[1:]
+            return [google_results[0]]
+        if not google_results:
+            fallback = await ai_fallback_place(city, category_for_google)
+            return [fallback] if fallback else []
+        return google_results
     clauses = []
     params: list = []
 
@@ -1222,9 +1393,11 @@ def fetch_random_place(
 
     base_sql = "SELECT * FROM restaurants WHERE " + " AND ".join(clauses)
 
+    rows: list[dict] = []
     if category and category != "random":
-        row = conn.execute(base_sql + " ORDER BY rating DESC, RANDOM() LIMIT 1", params).fetchone()
-        if not row and not selected_category:
+        fetched = conn.execute(base_sql + " ORDER BY rating DESC, RANDOM() LIMIT 3", params).fetchall()
+        rows = list(map(row_dict, fetched))
+        if not rows and not selected_category:
             clauses_without_category = clauses[:-1]
             params_without_category = params[:-1]
             like = f"%{category.lower()}%"
@@ -1232,16 +1405,13 @@ def fetch_random_place(
             clauses_without_category.append(fallback_clause)
             params_without_category.extend([like, like, like, like])
             fallback_sql = "SELECT * FROM restaurants WHERE " + " AND ".join(clauses_without_category)
-            row = conn.execute(fallback_sql + " ORDER BY rating DESC, RANDOM() LIMIT 1", params_without_category).fetchone()
+            fetched = conn.execute(fallback_sql + " ORDER BY rating DESC, RANDOM() LIMIT 3", params_without_category).fetchall()
+            rows = list(map(row_dict, fetched))
     else:
-        row = conn.execute(base_sql + " ORDER BY rating DESC, RANDOM() LIMIT 1", params).fetchone()
+        fetched = conn.execute(base_sql + " ORDER BY rating DESC, RANDOM() LIMIT 3", params).fetchall()
+        rows = list(map(row_dict, fetched))
 
-    # ⛔ ВАЖНО: не прыгать на другие города/категории, если в этом городе ничего нет
-    if not row:
-        return None
-
-    data = row_dict(row)
-    if data:
+    for data in rows:
         if not data.get("category"):
             detected_category = detect_category_from_text(data.get("tags"), data.get("keywords"))
             if category and category != "random":
@@ -1250,7 +1420,118 @@ def fetch_random_place(
                 data["category"] = detected_category
         elif category and category != "random":
             data["category"] = category
-    return data
+
+    # Шаг 2 — если база пуста по городу/вкусу, пробуем Google Places
+    if not rows:
+        category_for_google = category if category and category != "random" else None
+        google_results = await google_places_search(city, category_for_google)
+        for place in google_results:
+            if category_for_google:
+                place["category"] = category_for_google
+        return google_results
+
+    # Если есть локальные, всё равно не прыгаем в другой город; возвращаем уникальные варианты
+    seen = set()
+    unique_rows: list[dict] = []
+    for item in rows:
+        key = normalize(item.get("name")) or str(item.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(item)
+    return unique_rows
+
+
+async def google_places_search(city: str, taste: Optional[str]) -> list[dict]:
+    if not GOOGLE_PLACES_KEY:
+        return []
+
+    taste_query = GOOGLE_TASTE_QUERIES.get(taste or "", "") if taste and taste != "random" else ""
+    query = f"{taste_query} {city or ''}".strip() or "ресторан"
+
+    params = {
+        "query": query or "restaurant",
+        "language": "ru",
+        "key": GOOGLE_PLACES_KEY,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            response = await client.get(GOOGLE_PLACES_ENDPOINT, params=params)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        log.warning("Google Places request failed: %s", exc)
+        return []
+
+    status = (payload or {}).get("status")
+    if status not in ("OK", "ZERO_RESULTS"):
+        log.warning("Google Places returned non-ok status: %s", status)
+    items = (payload or {}).get("results") or []
+
+    normalized: list[dict] = []
+    allowed = GOOGLE_ALLOWED_TYPES.get(taste) if taste else None
+    city_norm = normalize(city)
+
+    filtered_items = []
+    for raw in items:
+        types = set(t.lower() for t in (raw.get("types") or []))
+        if allowed and types:
+            if not (types & allowed):
+                continue
+        # Мягкая проверка по городу — но если не совпадает, не берём (чтобы не подмешивать Астану)
+        addr = (raw.get("formatted_address") or "").lower()
+        name = (raw.get("name") or "").lower()
+        if city_norm and city_norm not in addr and city_norm not in name:
+            continue
+        filtered_items.append(raw)
+    if city_norm:
+        items_to_use = filtered_items
+    else:
+        items_to_use = filtered_items or items
+
+    target_taste = taste if taste and taste != "random" else None
+    for item in items_to_use:
+        name = item.get("name") or ""
+        types = item.get("types") or []
+        description_text = ", ".join(t.replace("_", " ") for t in types if t)
+        location = (item.get("geometry") or {}).get("location") or {}
+        lat, lng = location.get("lat"), location.get("lng")
+        photo_url = None
+        photos = item.get("photos") or []
+        if photos:
+            ref = photos[0].get("photo_reference")
+            if ref:
+                photo_url = f"{GOOGLE_PHOTO_ENDPOINT}?maxwidth=800&photo_reference={ref}&key={GOOGLE_PLACES_KEY}"
+        opening_info = item.get("opening_hours") or {}
+        is_open = opening_info.get("open_now") if isinstance(opening_info, dict) else None
+
+        detected = detect_category_from_text(name, description_text)
+        category = target_taste or detected
+        if target_taste and detected and detected != target_taste:
+            continue
+        category = target_taste or category
+
+        normalized.append(
+            {
+                "id": item.get("place_id") or item.get("id") or str(uuid.uuid4()),
+                "place_id": item.get("place_id"),
+                "name": name,
+                "address": item.get("formatted_address") or "",
+                "rating": item.get("rating"),
+                "photo_url": photo_url,
+                "description": description_text or item.get("business_status"),
+                "category": category,
+                "cuisine": description_text,
+                "latitude": lat,
+                "longitude": lng,
+                "opening_hours": None,
+                "is_open": is_open,
+                "source": "google",
+                "city": city,
+            }
+        )
+    random.shuffle(normalized)
+    return normalized
 
 
 def apply_feedback(conn, chat_id: int, item: dict, item_type: str, liked: bool):
@@ -1781,18 +2062,66 @@ async def send_place_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, plac
     category_label = place.get("category") or context.user_data.get("taste") or "unknown"
     print(f"[{category_label}] shown place: {place.get('name')}")
     intro = random.choice(PLACE_INTROS)
-    caption = (
-        f"{intro}\n\n"
-        f"🍴 {place['name']}\n📍 {place['address']} · ⭐️ {place.get('rating', '4.5')} · {place.get('cuisine', '')}"
-    )
-    kb = InlineKeyboardMarkup([
+    rating = place.get("rating")
+    cuisine = place.get("cuisine") or place.get("description") or ""
+    address = place.get("address") or ""
+    schedule = place.get("opening_hours") or place.get("working_hours")
+    is_open = place.get("is_open")
+    taste_emoji = {
+        "sweet": "🍰",
+        "salty": "🍕",
+        "spicy": "🌶",
+        "healthy": "🥗",
+    }.get(category_label, "🍴")
+    caption_lines = [
+        intro,
+        "",
+        f"{taste_emoji} {place.get('name', 'Заведение')}",
+    ]
+    details = []
+    if rating is not None:
+        details.append(f"⭐️ {rating}")
+    else:
+        details.append("⭐️ —")
+    if cuisine:
+        details.append(cuisine)
+    if details:
+        caption_lines.append(" · ".join(details))
+    if address:
+        caption_lines.append(f"📍 {address}")
+    if schedule:
+        caption_lines.append(f"⏰ {schedule}")
+    elif is_open is not None:
+        caption_lines.append("⏰ Открыто сейчас" if is_open else "⏰ Сейчас закрыто")
+    caption = "\n".join(filter(None, caption_lines))
+    map_url = None
+    lat, lng = place.get("latitude"), place.get("longitude")
+    if lat is not None and lng is not None:
+        map_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+    elif address:
+        map_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(address)}"
+    item_id = suggestion_id(place)
+    like_cb = f"place:like:{item_id}" if item_id is not None else "place:like"
+    dislike_cb = f"place:dislike:{item_id}" if item_id is not None else "place:dislike"
+    fav_cb = f"fav_add|{item_id or uuid.uuid4()}"
+    kb_buttons = [
         [
-            InlineKeyboardButton("👍 Нравится", callback_data=f"place:like:{place['id']}"),
-            InlineKeyboardButton("👎 Не нравится", callback_data=f"place:dislike:{place['id']}"),
+            InlineKeyboardButton("👍 Нравится", callback_data=like_cb),
+            InlineKeyboardButton("👎 Не нравится", callback_data=dislike_cb),
+        ],
+        [
+            InlineKeyboardButton("❤️ В избранное", callback_data=fav_cb),
             InlineKeyboardButton("🔁 Следующее", callback_data="place:next"),
-        ]
-    ])
-    image_name = place.get("image") or CATEGORY_MEDIA.get(place.get("category") or context.user_data.get("taste"))
+        ],
+    ]
+    if map_url:
+        kb_buttons[-1].append(InlineKeyboardButton("🗺 На карте", url=map_url))
+    kb = InlineKeyboardMarkup(kb_buttons)
+    image_name = (
+        place.get("photo_url")
+        or place.get("image")
+        or CATEGORY_MEDIA.get(place.get("category") or context.user_data.get("taste"))
+    )
     await send_visual(context, chat_id, image_name, caption, reply_markup=kb)
     update_last_suggestion(context, "place", suggestion_id(place))
 
@@ -1852,49 +2181,79 @@ async def send_random_place(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     state = ensure_user_state(user_id)
     city_state = state.get("city") or context.user_data.get("city")
     city = city_state or "Алматы"
-    city_canonical = canonicalize_city(city)
+    # Не меняем город для Google, но для Астаны оставляем канонизацию
+    city_canonical = canonicalize_city(city) if normalize(city) == normalize("Астана") else city
     context.user_data["city"] = city_canonical
     remember_context(user_id, city=city_canonical)
     preferred_taste = taste or context.user_data.get("taste") or state.get("category")
     explicit_category = get_selected_category(context)
     with closing(get_conn()) as conn:
-        place = fetch_random_place(conn, chat_id, city_canonical, preferred_taste, selected_category=explicit_category)
-    if not place:
-        context.user_data["stage"] = UserFlow.showing_result.name
-        await handle_no_results(
-            context,
+        places = await fetch_random_place(
+            conn,
             chat_id,
-            user_id=user_id,
-            mode="restaurant",
-            category=preferred_taste,
-            query=None,
-            city=city_canonical,
+            city_canonical,
+            preferred_taste,
+            selected_category=explicit_category,
+            context=context,
         )
-        set_processing_random(user_id, False)
-        return
+    if not places:
+        ai_place = await ai_fallback_place(city_canonical, preferred_taste)
+        if ai_place:
+            places = [ai_place]
+        else:
+            context.user_data["stage"] = UserFlow.showing_result.name
+            await handle_no_results(
+                context,
+                chat_id,
+                user_id=user_id,
+                mode="restaurant",
+                category=preferred_taste,
+                query=None,
+                city=city_canonical,
+            )
+            set_processing_random(user_id, False)
+            return
     last_place_id = get_last_suggestions(context).get("place")
-    if suggestion_id(place) == last_place_id:
-        for _ in range(3):
+    first_place = None
+    for candidate in places:
+        first_place = candidate
+        if suggestion_id(candidate) != last_place_id:
+            break
+    first_place = first_place or places[0]
+    if suggestion_id(first_place) == last_place_id:
+        # Попробуем достать следующий элемент из очереди Google
+        category_for_google = preferred_taste if preferred_taste and preferred_taste != "random" else explicit_category
+        queue = _google_queue(context)
+        key = _google_queue_key(city_canonical, category_for_google)
+        bucket = queue.get(key, [])
+        while bucket and suggestion_id(bucket[0]) == last_place_id:
+            bucket.pop(0)
+        if bucket:
+            first_place = bucket.pop(0)
+            places = [first_place]
+        else:
+            # Сделаем ещё один запрос
             with closing(get_conn()) as conn:
-                alt = fetch_random_place(
+                retry = await fetch_random_place(
                     conn,
                     chat_id,
                     city_canonical,
                     preferred_taste,
                     selected_category=explicit_category,
+                    context=context,
                 )
-            if not alt or suggestion_id(alt) != last_place_id:
-                place = alt or place
-                break
-    category = place.get("category") or preferred_taste
-    store_queue(context, "place", [place], {"kind": "random", "taste": category, "city": city_canonical})
+            if retry:
+                first_place = retry[0]
+                places = retry
+    category = first_place.get("category") or preferred_taste
+    store_queue(context, "place", places, {"kind": "random", "taste": category, "city": city_canonical})
     context.user_data["stage"] = UserFlow.showing_result.name
     context.user_data["taste"] = category
     remember_context(
         user_id,
         mode=context.user_data.get("mode"),
         category=category,
-        last_choice=place.get("name"),
+        last_choice=first_place.get("name"),
         last_action="random_place",
     )
     try:
@@ -1902,7 +2261,7 @@ async def send_random_place(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     except TelegramError:
         pass
     await cozy_delay()
-    await send_place_card(context, chat_id, place)
+    await send_place_card(context, chat_id, first_place)
     set_processing_random(user_id, False)
 
 
@@ -2065,7 +2424,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_recipe_card(context, chat_id, first_recipe)
         else:
             city_value = canonicalize_city(city or "Алматы") or "Алматы"
-            places = fetch_restaurants(
+            places = await fetch_restaurants(
                 conn,
                 city_value,
                 terms,
@@ -2075,7 +2434,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_category=explicit_category,
             )
             if not places and taste and taste != "random":
-                places = fetch_restaurants(
+                places = await fetch_restaurants(
                     conn,
                     city_value,
                     [],
@@ -2161,6 +2520,7 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
     context.user_data.pop(SKIP_NEXT_MESSAGE, None)
     kind = meta.get("kind")
     explicit_category = get_selected_category(context)
+    place_candidates: list[dict] = []
     with closing(get_conn()) as conn:
         if item_type == "recipe":
             if kind == "random":
@@ -2183,15 +2543,18 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
         else:
             city = meta.get("city") or context.user_data.get("city", "Алматы")
             if kind == "random":
-                new_item = fetch_random_place(
+                new_items = await fetch_random_place(
                     conn,
                     chat_id,
                     city,
                     meta.get("taste"),
                     selected_category=explicit_category,
+                    context=context,
                 )
+                place_candidates = new_items or []
+                new_item = place_candidates[0] if place_candidates else None
             else:
-                new_items = fetch_restaurants(
+                new_items = await fetch_restaurants(
                     conn,
                     city,
                     meta.get("terms", []),
@@ -2200,7 +2563,8 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
                     primary=meta.get("primary"),
                     selected_category=explicit_category,
                 )
-                new_item = new_items[0] if new_items else None
+                place_candidates = new_items or []
+                new_item = place_candidates[0] if place_candidates else None
     if not new_item:
         label = taste_label(meta.get("taste"))
         await context.bot.send_message(
@@ -2210,6 +2574,11 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
         )
         return
     last_id = get_last_suggestions(context).get("recipe" if item_type == "recipe" else "place")
+    if item_type == "place" and place_candidates and suggestion_id(new_item) == last_id:
+        for candidate in place_candidates:
+            if suggestion_id(candidate) != last_id:
+                new_item = candidate
+                break
     if suggestion_id(new_item) == last_id:
         with closing(get_conn()) as conn:
             if item_type == "recipe":
@@ -2220,16 +2589,23 @@ async def next_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item_type:
                     selected_category=explicit_category,
                 )
             else:
-                alt = fetch_random_place(
+                alt_items = await fetch_random_place(
                     conn,
                     chat_id,
                     meta.get("city") or context.user_data.get("city", "Алматы"),
                     meta.get("taste"),
                     selected_category=explicit_category,
+                    context=context,
                 )
+                alt = alt_items[0] if alt_items else None
+                if alt_items:
+                    place_candidates = alt_items
         if alt and suggestion_id(alt) != last_id:
             new_item = alt
-    store_queue(context, item_type, [new_item], meta)
+    if item_type == "place" and place_candidates:
+        store_queue(context, item_type, place_candidates, meta)
+    else:
+        store_queue(context, item_type, [new_item], meta)
     if item_type == "recipe":
         await send_recipe_card(context, chat_id, new_item)
     else:
@@ -2245,15 +2621,21 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item_type, action, *rest = parts
     message = query.message
     chat_id = message.chat.id if message and message.chat else query.from_user.id
-    item_id = int(rest[0]) if rest else None
+    raw_item_id = rest[0] if rest else None
+    try:
+        item_id = int(raw_item_id) if raw_item_id is not None else None
+    except ValueError:
+        item_id = raw_item_id
     user_id = query.from_user.id
     answered = False
 
     with closing(get_conn()) as conn, conn:
         if item_type == "recipe":
-            item = fetch_recipe_by_id(conn, item_id) if item_id else current_item(context, "recipe")
+            item = fetch_recipe_by_id(conn, item_id) if isinstance(item_id, int) else current_item(context, "recipe")
         else:
-            item = fetch_restaurant_by_id(conn, item_id) if item_id else current_item(context, "place")
+            item = fetch_restaurant_by_id(conn, item_id) if isinstance(item_id, int) else None
+            if not item:
+                item = current_item(context, "place")
         current_item_id = suggestion_id(item)
 
         if not item:
@@ -2305,10 +2687,51 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
 
+async def add_place_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2:
+        await query.answer()
+        return
+    _, raw_place_id = parts
+    place_id = raw_place_id or None
+    chat_id = query.from_user.id
+    await query.answer()
+
+    place = current_item(context, "place")
+    if not place or (place_id and str(suggestion_id(place))) != place_id:
+        with closing(get_conn()) as conn:
+            try:
+                numeric_id = int(place_id) if place_id is not None else None
+            except ValueError:
+                numeric_id = None
+            if numeric_id is not None:
+                place = fetch_restaurant_by_id(conn, numeric_id)
+    if not place:
+        await query.message.reply_text("Не удалось добавить в избранное 😔")
+        return
+
+    place_id = place_id or str(suggestion_id(place) or uuid.uuid4())
+    name = place.get("name") or "Без названия"
+    address = place.get("address") or ""
+    photo_url = place.get("photo_url") or place.get("image")
+
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO favorite_places(chat_id, place_id, name, address, photo_url)
+            VALUES(?,?,?,?,?)
+            """,
+            (chat_id, place_id, name, address, photo_url),
+        )
+    await query.message.reply_text("❤️ Добавил в избранное!")
+
+
 async def favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with closing(get_conn()) as conn:
-        rows = conn.execute(
+        recipe_rows = conn.execute(
             """
             SELECT r.title
             FROM user_history h
@@ -2319,11 +2742,27 @@ async def favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """,
             (chat_id,),
         ).fetchall()
-    if not rows:
-        await update.message.reply_text("Пока ничего нет. ❤️ Добавляй понравившиеся блюда!")
+        place_rows = conn.execute(
+            """
+            SELECT name, address
+            FROM favorite_places
+            WHERE chat_id=?
+            ORDER BY name
+            LIMIT 15
+            """,
+            (chat_id,),
+        ).fetchall()
+    if not recipe_rows and not place_rows:
+        await update.message.reply_text("Пока ничего нет. ❤️ Добавляй понравившиеся блюда и места!")
         return
-    titles = "\n".join(f"• {row['title']}" for row in rows)
-    await update.message.reply_text(f"Твои любимые блюда 🍽:\n{titles}")
+    parts = []
+    if recipe_rows:
+        titles = "\n".join(f"• {row['title']}" for row in recipe_rows)
+        parts.append(f"Блюда 🍽:\n{titles}")
+    if place_rows:
+        places_text = "\n".join(f"• {row['name']} ({row['address']})" for row in place_rows)
+        parts.append(f"Места 🏙:\n{places_text}")
+    await update.message.reply_text("\n\n".join(parts))
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2387,6 +2826,7 @@ def main():
     app.add_handler(CommandHandler("recipe", recipe_cmd))
     app.add_handler(CommandHandler("place", place_cmd))
     app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(add_place_favorite, pattern="^fav_add\\|"))
     app.add_handler(CallbackQueryHandler(feedback_handler, pattern="^(recipe|place):"))
     app.add_handler(CallbackQueryHandler(ai_feedback_callback, pattern="^ai_(like|dislike|next)\\|"))
     app.add_handler(CommandHandler("favorites", favorites))

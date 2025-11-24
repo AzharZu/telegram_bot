@@ -2,3 +2,4 @@ python-telegram-bot==20.7
 python-dotenv==1.0.1
 google-generativeai==0.5.3
 PyQt5>=5.15.0
+httpx>=0.25.2,<0.26

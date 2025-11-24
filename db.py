@@ -81,6 +81,15 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS favorite_places(
+            chat_id INTEGER,
+            place_id TEXT,
+            name TEXT,
+            address TEXT,
+            photo_url TEXT,
+            PRIMARY KEY(chat_id, place_id)
+        );
+
         CREATE TABLE IF NOT EXISTS user_history(
             chat_id INTEGER,
             item_id INTEGER,
@@ -174,6 +183,10 @@ def init_db():
             "ALTER TABLE recipes ADD COLUMN ingredients_en TEXT",
             "ALTER TABLE recipes ADD COLUMN steps_en TEXT",
             "ALTER TABLE recipes ADD COLUMN photo_url TEXT",
+            "ALTER TABLE favorites ADD COLUMN place_id TEXT",
+            "ALTER TABLE favorites ADD COLUMN name TEXT",
+            "ALTER TABLE favorites ADD COLUMN address TEXT",
+            "ALTER TABLE favorites ADD COLUMN photo_url TEXT",
             "ALTER TABLE restaurants ADD COLUMN contact TEXT",
             "ALTER TABLE restaurants ADD COLUMN reaction TEXT",
             "ALTER TABLE restaurants ADD COLUMN keywords TEXT",
@@ -201,6 +214,7 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_restaurants_category ON restaurants(category)",
             "CREATE INDEX IF NOT EXISTS idx_restaurants_tags ON restaurants(tags)",
             "CREATE INDEX IF NOT EXISTS idx_restaurants_keywords ON restaurants(keywords)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_favorites_place ON favorites(chat_id, place_id) WHERE place_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_history_chat ON user_history(chat_id)",
             "CREATE INDEX IF NOT EXISTS idx_tastes_chat ON user_tastes(chat_id)",
             "CREATE INDEX IF NOT EXISTS idx_preferences_user ON user_preferences(user_id)",
